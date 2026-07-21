@@ -1,0 +1,18 @@
+[package]
+name = "rev_shell_wss"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+boring = "4"
+libc = "0.2"
+rand = "0.9"
+tungstenite = "0.26"
+url = "2"
+
+[profile.release]
+opt-level = "z"       # optimize for size
+lto = true            # link-time optimization (strips dead code, merges objects)
+codegen-units = 1     # single codegen unit for better optimization
+panic = "abort"       # no unwinding tables
+strip = "symbols"     # strip all symbols from binary

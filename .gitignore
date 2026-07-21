@@ -1,0 +1,16 @@
+# Build artifacts
+target/
+*.exe
+implant
+
+# TLS certificates (generated at runtime)
+cert.pem
+key.pem
+
+# Swap files
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
