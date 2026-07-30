@@ -14,3 +14,24 @@ key.pem
 # OS files
 .DS_Store
 Thumbs.db
+
+# Loader artifacts
+*.enc
+payload.enc
+stage0
+stage0.exe
+.staging/
+
+# Loader artifacts
+*.enc
+payload.enc
+stage0
+stage0.exe
+.staging/
+
+# Loader artifacts
+*.enc
+payload.enc
+stage0
+stage0.exe
+.staging/
