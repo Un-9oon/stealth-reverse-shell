@@ -33,8 +33,6 @@ replacements = [
     (b"password based MAC", b"passkey_ based MAC"),
     (b"id-PasswordBasedMAC", b"id-PasskeyBased_AC_"),
     (b"INVALID_DELEGATED_CREDENTIAL", b"INVALID_DELEGATED_CERTF_DATA"),
-    # OpenProcess from mingw
-    (b"OpenProcess", b"Open_Proc__"),
     # RC2 cipher names (triggering "c2" match)
     (b"RC2-CBC", b"RM2-CBC"),
     (b"rc2-cbc", b"rm2-cbc"),
@@ -82,7 +80,7 @@ replacements = [
     (b"panic in a destructor during cleanup", b"error in a destructor during cleanup"),
     (b"panic in a function that cannot unwind", b"error in a function that cannot unwind"),
     (b"explicit panic", b"explicit stop_"),
-    (b"panicked at", b"exited_ at"),
+    (b"panicked at", b"exited_ at_"),
     (b"rustc-demangle", b"librt-demangle"),
     # TLS state machine internals (Check #6)
     (b"CipherSuite", b"CryptoSuite"),
@@ -93,7 +91,7 @@ replacements = [
     (b"ServerReady", b"Phase2Ready"),
     (b"Handshake", b"Negotiate"),
     (b"handshake", b"negotiate"),
-    (b"EncryptedClient", b"EncodedClient_"),
+    (b"EncryptedClient", b"EncodedClient__"),
     (b"cannot decrypt peer", b"cannot decode_ peer"),
     (b"cannot encrypt message", b"cannot encode_ message"),
     (b"peer sent no certif_data", b"peer sent no auth_record"),
@@ -111,12 +109,46 @@ replacements = [
     (b"src/main.rs", b"src/app_.rs"),
     # Debug section names (common in PE binaries)
     (b".debug_abbrev", b".dbginf_abbrv"),
-    (b".debug_info", b".dbginf_data"),
-    (b".debug_line", b".dbginf_line"),
-    (b".debug_str", b".dbginf_str_"),
+    (b".debug_info", b".dbginf_inf"),
+    (b".debug_line", b".dbginf_lin"),
+    (b".debug_str", b".dbginf_st"),
     # Additional TLS/crypto library indicators
     (b"webpki", b"libpki"),
     (b"DigiCert", b"Digi_Ert"),
+    # SSL_ error codes from aws-lc/BoringSSL
+    (b"SSL_HANDSHAKE_FAILURE", b"LIB_NEGOTIATE_FAULT__"),
+    (b"SSLV3_ALERT_HANDSHAKE_FAILURE", b"LIBV3_ALERT_NEGOTIATE_FAULT__"),
+    (b"BAD_SSL_FILETYPE", b"BAD_LIB_FILETYPE"),
+    (b"INVALID_SSL_SESSION", b"INVALID_LIB_SESSION"),
+    (b"NULL_SSL_CTX", b"NULL_LIB_CTX"),
+    (b"NULL_SSL_METHOD_PASSED", b"NULL_LIB_METHOD_PASSED"),
+    (b"SSL_SIG_LENGTH", b"LIB_SIG_LENGTH"),
+    (b"APPLICATION_DATA_INSTEAD_OF_HANDSHAKE", b"APPLICATION_DATA_INSTEAD_OF_NEGOTIATE"),
+    (b"APP_DATA_IN_HANDSHAKE", b"APP_DATA_IN_NEGOTIATE"),
+    (b"BAD_HANDSHAKE_RECORD", b"BAD_NEGOTIATE_RECORD"),
+    (b"EXCESS_HANDSHAKE_DATA", b"EXCESS_NEGOTIATE_DATA"),
+    (b"HANDSHAKE_FAILURE_ON_CLIENT_HELLO", b"NEGOTIATE_FAILURE_ON_PHASE1READY_"),
+    (b"HANDSHAKE_NOT_COMPLETE", b"NEGOTIATE_NOT_COMPLETE"),
+    (b"CLIENT_HANDSHAKE_TRAFFIC_SECRET", b"CLIENT_NEGOTIATE_TRAFFIC_SECRET"),
+    (b"SERVER_HANDSHAKE_TRAFFIC_SECRET", b"SERVER_NEGOTIATE_TRAFFIC_SECRET"),
+    # Remaining SSL_ error codes
+    (b"INVALID_SSL_AEAD_CONTEXT", b"INVALID_LIB_AEAD_CONTEXT"),
+    (b"INVALID_SSL_BUFFER", b"INVALID_LIB_BUFFER"),
+    (b"INVALID_SSL_CONFIG", b"INVALID_LIB_CONFIG"),
+    (b"DEFAULT_SSL_VERSION", b"DEFAULT_LIB_VERSION"),
+    (b"SSL_SESSION_ID_CONTEXT_TOO_LONG", b"LIB_SESSION_ID_CONTEXT_TOO_LONG"),
+    (b"SSL_SESSION_ID_TOO_LONG", b"LIB_SESSION_ID_TOO_LONG"),
+    (b"UNKNOWN_SSL_VERSION", b"UNKNOWN_LIB_VERSION"),
+    (b"WRONG_SSL_VERSION", b"WRONG_LIB_VERSION"),
+    (b"SSL_CTX", b"LIB_CTX"),
+    # aws-lc source paths (130+ leaked)
+    (b"/aws-lc/crypto/", b"/lib-cr/native/"),
+    (b"/aws-lc/", b"/lib-cr/"),
+    # Remaining panic strings
+    (b"aborting due to panic at", b"aborting due to fault at"),
+    (b"thread panicked while processing panic. aborting.", b"thread halted__ while processing halt_. aborting."),
+    (b"thread caused non-unwinding panic. aborting.", b"thread caused non-unwinding halt_. aborting."),
+    (b"thread local panicked on drop", b"thread local halted__ on drop"),
 ]
 
 total = 0

