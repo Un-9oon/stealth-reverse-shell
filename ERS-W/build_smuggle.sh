@@ -102,4 +102,29 @@ echo -e "  ${Y}Press Ctrl+C to stop${N}"
 echo ""
 
 cd "$DIR"
-python3 -m http.server "$SERVE_PORT" --bind 0.0.0.0
+python3 -c "
+import http.server, socketserver, sys, signal
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+    def finish(self):
+        try:
+            super().finish()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
+class Server(socketserver.TCPServer):
+    allow_reuse_address = True
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if not isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            super().handle_error(request, client_address)
+
+with Server(('0.0.0.0', int(sys.argv[1])), Handler) as httpd:
+    httpd.serve_forever()
+" "$SERVE_PORT"

