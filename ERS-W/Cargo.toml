@@ -28,6 +28,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Environment",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_LibraryLoader",
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
 
 [profile.release]
@@ -35,3 +36,6 @@ opt-level = "z"
 lto = true
 strip = true
 panic = "abort"
+
+[profile.dev]
+panic = "unwind"
