@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="453" height="360"><rect width="100%" height="100%" fill="white"/>
+<rect x="2" y="15" width="76" height="30" rx="3" fill="#EDF4F7" stroke="#176B91"/>
+<text x="40" y="33" text-anchor="middle" font-family="Arial" font-size="8">Operator</text>
+<line x1="40" y1="50" x2="40" y2="350" stroke="#176B91" stroke-dasharray="3 3"/>
+<rect x="97" y="15" width="76" height="30" rx="3" fill="#EDF4F7" stroke="#176B91"/>
+<text x="135" y="33" text-anchor="middle" font-family="Arial" font-size="8">Importer</text>
+<line x1="135" y1="50" x2="135" y2="350" stroke="#176B91" stroke-dasharray="3 3"/>
+<rect x="192" y="15" width="76" height="30" rx="3" fill="#EDF4F7" stroke="#176B91"/>
+<text x="230" y="33" text-anchor="middle" font-family="Arial" font-size="8">Classifier</text>
+<line x1="230" y1="50" x2="230" y2="350" stroke="#176B91" stroke-dasharray="3 3"/>
+<rect x="287" y="15" width="76" height="30" rx="3" fill="#EDF4F7" stroke="#176B91"/>
+<text x="325" y="33" text-anchor="middle" font-family="Arial" font-size="8">Evidence</text>
+<line x1="325" y1="50" x2="325" y2="350" stroke="#176B91" stroke-dasharray="3 3"/>
+<rect x="382" y="15" width="76" height="30" rx="3" fill="#EDF4F7" stroke="#176B91"/>
+<text x="420" y="33" text-anchor="middle" font-family="Arial" font-size="8">Evaluator</text>
+<line x1="420" y1="50" x2="420" y2="350" stroke="#176B91" stroke-dasharray="3 3"/>
+<path d="M 40 73 H 135 M 130 70 L 135 73 L 130 76" fill="none" stroke="#176B91"/>
+<text x="87.5" y="67" text-anchor="middle" font-family="Arial" font-size="7.5">Approved observation export</text>
+<path d="M 135 103 H 230 M 225 100 L 230 103 L 225 106" fill="none" stroke="#176B91"/>
+<text x="182.5" y="97" text-anchor="middle" font-family="Arial" font-size="7.5">Sanitized task window</text>
+<path d="M 230 133 H 135 M 140 130 L 135 133 L 140 136" fill="none" stroke="#176B91"/>
+<text x="182.5" y="127" text-anchor="middle" font-family="Arial" font-size="7.5">Outcome or abstention</text>
+<path d="M 135 163 H 325 M 320 160 L 325 163 L 320 166" fill="none" stroke="#176B91"/>
+<text x="230.0" y="157" text-anchor="middle" font-family="Arial" font-size="7.5">Freeze prediction + evidence</text>
+<path d="M 325 193 H 420 M 415 190 L 420 193 L 415 196" fill="none" stroke="#176B91"/>
+<text x="372.5" y="187" text-anchor="middle" font-family="Arial" font-size="7.5">Prediction snapshot</text>
+<path d="M 420 223 H 325 M 330 220 L 325 223 L 330 226" fill="none" stroke="#176B91"/>
+<text x="372.5" y="217" text-anchor="middle" font-family="Arial" font-size="7.5">Separate verified label</text>
+<path d="M 420 253 H 40 M 45 250 L 40 253 L 45 256" fill="none" stroke="#176B91"/>
+<text x="230.0" y="247" text-anchor="middle" font-family="Arial" font-size="7.5">Comparison report</text>
+</svg>
